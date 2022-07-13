@@ -2468,21 +2468,6 @@ final_output |>
 
 ```{r}
 
-test1 <- 
-  data_clean |> 
-  filter(!is.na(count_raw), 
-         year >= 2008) |> 
-  select(site_code, year) |> 
-  distinct() |> 
-  mutate(site_yr = paste(site_code, year))
-
-
-data_clean |> 
-  mutate(site_yr = paste(site_code, year)) |> 
-  filter(site_yr %!in% test1$site_yr) |> 
-  pull(site_code) |> unique()
-
-
 taxon_cols2 <-
   c(
     Vertebrates = "#ffd600ff",
@@ -2510,7 +2495,6 @@ extended_fig02 <-
   mutate(n_annual_survs_edit = ifelse(n_annual_survs == 1, n_annual_survs + pre2008, n_annual_survs)) |> 
   arrange(desc(n_annual_survs_edit)) |> 
   count(taxon, n_annual_survs_edit, name = "n_sites") |> 
-  # filter(n_annual_survs_edit > 1) |> 
   mutate(taxon = factor(taxon, 
                         levels = c("Vertebrate", 
                                    "Invertebrate",
@@ -2552,6 +2536,15 @@ save_plot(filename = here("output", "figs", "extended_fig02.png"),
           base_height = 7)
 
 ```
+
+
+
+```{r view-extended-fig2}
+
+here("output", "figs", "extended_fig02.png") |> knitr::include_graphics()
+
+```
+
 
 ### Biogeography trends without interpolation
 
@@ -2799,6 +2792,12 @@ extended_fig03 <-
 save_plot(filename = here("output", "figs", "extended_fig03.png"), 
           plot = extended_fig03, 
           base_height = 7)
+
+```
+
+```{r view-extended-fig3}
+
+here("output", "figs", "extended_fig03.png") |> knitr::include_graphics()
 
 ```
 
@@ -3074,5 +3073,11 @@ save_plot(filename = here("output", "figs", "sensitivity_analysis.png"),
           plot = p_sens, 
           base_height = 11, 
           base_asp = 0.6 )
+
+```
+
+```{r view-sensitivity}
+
+here("output", "figs", "sensitivity_analysis.png") |> knitr::include_graphics()
 
 ```
