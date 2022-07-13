@@ -1,0 +1,3078 @@
+---
+title: "Continent-wide declines in reef species over a decade of ocean warming"
+author: "Freddie J. Heather"
+date: "Last compiled on: `r Sys.Date()`"
+output: 
+  rmdformats::downcute:
+  # bookdown::html_document2:
+    code_folding: show
+---
+
+
+# About this script
+
+The following document provides the R code for the analysis for the paper: Edgar *et al.* (In review.) Continent-wide trends in reef populations over a decade of ocean warming.
+
++------------------------+-------------------------------------------------------------------------------------------------------+
+| **R-version**          | 4.2.0 (2022-04-22)                                                                                    |
++------------------------+-------------------------------------------------------------------------------------------------------+
+| **platform**           | x86_64-w64-mingw32                                                                                    |
++------------------------+-------------------------------------------------------------------------------------------------------+
+| **Article DOI**        |                                                                                                       |
++------------------------+-------------------------------------------------------------------------------------------------------+
+| **Article link**       |                                                                                                       |
++------------------------+-------------------------------------------------------------------------------------------------------+
+| **Article citation**   | Edgar *et al.* (In review.) Continent-wide trends in reef populations over a decade of ocean warming. |
++------------------------+-------------------------------------------------------------------------------------------------------+
+| **Time series**        | 1992-2021                                                                                             |
++------------------------+-------------------------------------------------------------------------------------------------------+
+| **Geographical scale** | Continental Australia                                                                                 |
++------------------------+-------------------------------------------------------------------------------------------------------+
+| **Code author contact**| freddieheather@gmail.com                                                                              |
++------------------------+-------------------------------------------------------------------------------------------------------+
+
+
+# Set-up
+
+```{r knitr-options}
+#| include = FALSE
+
+library(knitr)
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+
+# save csv files for each step?
+save_csv <- TRUE
+
+```
+
+## Required R packages
+
+Loading the required packages for this analysis.
+
+```{r packages}
+
+library(tidyverse)
+library(janitor)
+library(zoo, include.only = "na.approx")
+library(magick)
+library(cowplot)
+library(scales)
+library(patchwork)
+library(ggpubr, include.only = "as_ggplot")
+library(ragg)
+library(gt)
+library(gtable)
+library(grid)
+library(nlme)
+library(here)
+library(kableExtra)
+
+# "not in" function
+`%!in%` <- Negate(`%in%`)
+
+```
+
+## Reading in raw data
+
+The raw data is in a wide format, with the site ID (`site_code`), survey method (`method`), species identity
+(`species_name`), and the standard density per 500 $m^2$ surveyed is
+stored within the year columns (e.g. `1992`, `1993`, etc.).
+
+```{r data-import}
+
+# main dataframe of species density
+data_raw_wide <- 
+  read_csv(file = here("input", "data", "count_data.csv"), 
+           show_col_types = FALSE, 
+           skip_empty_rows = TRUE) 
+
+# species-level information
+species_tbl <- 
+  read_csv(file =  here("input", "data", "species_info.csv"), 
+           show_col_types = FALSE, 
+           skip_empty_rows = TRUE) 
+
+# temperature timeseries (post-2008) data for each site
+temperature_raw <- 
+  read_csv(file =  here("input", "data", "temperature_timeseries.csv"),
+           show_col_types = FALSE, 
+           skip_empty_rows = TRUE)  
+
+```
+
+Let's look at the first six rows of the raw data (in wide format).
+
+```{r head-wide}
+
+data_raw_wide |> head()
+
+```
+
+# Data cleaning
+
+
+```{r checking-01}
+#| include = FALSE
+
+# should be zero length
+data_raw_wide |> 
+  filter(is.na(biogeog)) |> 
+  pull(species_name) |> 
+  unique()
+
+# should be zero length
+data_raw_wide |> 
+  filter(is.na(taxon)) |> 
+  pull(species_name) |> 
+  unique()
+
+```
+
+
+## Convert to long-format
+
+For the analysis, we want the data in a long (aka. tidy) format - a
+single row per observation. So we move the "year" columns to a single
+column (`year`) and add a column which we will call `count_raw`, which
+refers to the count for that species at that site at that year.
+
+We also change any zero-count values to NA for Macroalgae species, as macroalgae 
+were not surveyed every year. **Where appropriate** these
+will then be changed back to zero's in the next step.
+
+```{r pivot-long}
+
+# all year columns start with "x"
+data_raw_long <-
+  data_raw_wide |> 
+  pivot_longer(
+    cols = starts_with("x"),
+    values_to = "count_raw",
+    names_to = "year", 
+    names_prefix = "x",
+    names_transform = list(year = as.integer)
+  ) |> 
+  # all zero's become NA
+  mutate(count_raw = case_when(count_raw == 0 & taxon == "Macroalgae" ~ NA_real_,
+                                TRUE ~ count_raw))
+
+```
+
+## Convert NA values to zero
+
+We want NA values to be changed to zeros when all of the following
+conditions are met:
+
+1.  The site was surveyed that year.
+2.  The species was observed at least once at that site in any other year.
+3.  The taxon (Macroalgae) was recorded at that site at that year.
+4.  The current count is NA.
+
+To do this we need to make a list of all the site\*year combinations,
+all site\*species combinations, and all site\*year\*taxon combinations
+**that have at least one observation**. If the row in question has a
+site\*year combination that is found in the overall site\*year
+combination list, then we know that site was surveyed in that year and
+therefore meets the first condition. We repeat for the first three
+conditions, if all three are met and the count is NA, we replace with a
+zero value.
+
+```{r data-cleaning}
+
+# A list of all the site*year combinations
+site_byyear <-
+  data_raw_long |> 
+  filter(!(is.na(count_raw)|count_raw == 0)) |> # not recorded
+  select(site_id, year) |> 
+  distinct() |> 
+  mutate(site_id_yr = paste(site_id, year, sep = "_"))
+
+# A list of all the site*year*species combinations
+site_byspp <-
+  data_raw_long |> 
+  filter(!(is.na(count_raw)|count_raw == 0)) |> # not recorded
+  select(site_id, species_name) |> 
+  distinct() |> 
+  mutate(site_id_spp = paste(site_id, species_name, sep = "_"))
+
+
+# A list of all the site*year*taxon combinations
+# note: some surveys surveyed only a given taxa in a given year at a site 
+# (e.g. they may not have surveyed Macroalgae at site X in year Y, therefore 
+# the counts for Macroalgae at this site*year should be NA and not zero)
+# true example: JMP-S1 did not survey macroalgae in 2008 and 2015 
+site_byyr_bytaxon <-
+  data_raw_long |> 
+  filter(!(is.na(count_raw)|count_raw == 0)) |> # not recorded
+  # filter(!((is.na(count_raw)|count_raw == 0) & taxon != "Coral")) |> # not recorded
+  select(site_id, year, taxon) |> 
+  distinct() |> 
+  mutate(site_id_year_taxon = paste(site_id, year, taxon, sep = "_"))
+
+
+# changing NA counts to zero counts, where appropriate 
+# (i.e. meets the criteria above)
+data_addingzeros <- 
+  data_raw_long |> 
+  mutate(site_id_yr = paste(site_id, year, sep = "_"), 
+         site_id_spp = paste(site_id, species_name, sep = "_"), 
+         site_id_year_taxon = paste(site_id, year, taxon, sep = "_"), 
+         spp_at_site = site_id_spp %in% site_byspp$site_id_spp, 
+         was_surveyed = site_id_yr %in% site_byyear$site_id_yr, 
+         surveyed_taxon_that_year = 
+           site_id_year_taxon %in% site_byyr_bytaxon$site_id_year_taxon, 
+         na_count = is.na(count_raw)
+  ) |> 
+  mutate(count_raw = case_when(
+    na_count & 
+      was_surveyed & 
+      spp_at_site & 
+      surveyed_taxon_that_year ~ 0,
+    TRUE ~ count_raw
+  )) |> 
+  select(names(data_raw_long))
+
+
+```
+
+```{r checking-002}
+#| include = FALSE
+
+data_addingzeros |> filter(is.na(count_raw)) |> nrow()
+
+```
+
+## Final clean
+
+A few final clean-ups: rounding the latitude and longitude to 1x1 gricells, and creating a variable called `transect_id`, which is the site_id and the method, which represents a single transect ($500 m^2$ or $100 m^2$ depending on the method) performed.
+
+```{r final-clean}
+
+# this will be used as the main dataframe
+data_clean <- 
+  data_addingzeros |> 
+  ungroup() |> 
+  mutate(latitude  = round(latitude),
+         longitude = round(longitude)) |> 
+  mutate(transect_id = paste(site_id, method, sep = "_"))
+
+```
+
+Let's have a look at the first six rows of the cleaned data.
+
+```{r head-clean}
+data_clean |> head()
+
+data_clean |> 
+  pull(site_code) |> 
+  unique() |> 
+  length()
+
+
+data_clean |> 
+  select(site_code, data) |> 
+  distinct() |> 
+  nrow()
+
+data_clean |> 
+  select(site_code, data) |> 
+  distinct() |> 
+  count(data)
+
+data_clean |> 
+  select(site_code, data2 = data) |> 
+  distinct() |> 
+  mutate(n = 1) |> 
+  pivot_wider(names_from = c(data2), values_from  = n) |> 
+  rowwise() %>%
+  mutate(sum = sum(AIMS,ATRC, RLS, na.rm = T)) |> 
+  filter(sum != 1) 
+
+```
+
+Checking the number of years we have in the data?
+
+```{r number-years}
+
+data_clean |> pull(year) |> range()
+
+```
+
+# Data wrangling
+
+## Orgainising data
+
+Each row in the wide format corresponds to a population trend, each row
+has a unique site/data-source/method as well as unique species. Each
+species corresponds to a taxon (e.g., Vertebrate or Coral) and a
+biogeography (e.g., cool or warm). Each site corresponds to a specific
+state (e.g., Northeast or Northwest). We want to create two ID tables to
+be used for location-based information and species based information.
+
+1.  Species-level information (already exists; called `species_tbl`)
+2.  Location level information (transect-level; now called `transect_tbl`)
+
+If we need to access the transect-level or site-level information we can
+`left_join()` the ID tables to the basic dataframe (`data_basic`). Here
+I use the term "transect" to refer to the site/source/method
+combination.
+
+```{r data-wrangling}
+
+# unique identifier of the transect (site_code, data, and method)
+transect_tbl <-
+  data_clean |> 
+  select(transect_id, site_code, state, data, method, latitude, longitude) |> 
+  distinct()
+
+# only the columns we need
+data_basic <- 
+  data_clean |> 
+  select(transect_id, species_name, year, count_raw)
+
+
+```
+
+Let's check out the first six rows of the basic data frame. 
+
+```{r head-basic}
+data_basic |> head()
+```
+
+
+
+```{r data-output01}
+#| include = FALSE
+
+if(save_csv){
+  
+  data_basic |> 
+    select(transect_id, 
+           species_name, 
+           year, 
+           count_raw) |> 
+    left_join(transect_tbl, by = "transect_id") |> 
+    select(-transect_id) |> 
+    pivot_wider(values_from = count_raw,
+                names_from = year)  |>
+    write_csv(file = here("output", "data", "poptrend01.csv"),
+              na = "")
+}
+
+```
+
+## Wrangling temeprature data
+
+To get the temeprature values for each state (e.g. "Northeast", "Southwest" etc.), we get the mean temeprature (per year) for each 1x1 degree grid cells, and then the mean temperature for each state (by year).
+
+We then want to standardise the state temperature values relative to the values of 2008. 
+
+```{r}
+
+# state-level temperature values
+state_sst <- 
+  data_raw_wide |> 
+  select(site_name, state, latitude, longitude) |> 
+  mutate(latitude = round(latitude),
+         longitude = round(longitude)) |> 
+  distinct() |> 
+  left_join(temperature_raw, by = "site_name") |> 
+  drop_na() |>
+  group_by(state, latitude, longitude, year) |> 
+  summarise(mean_sst = mean(sst), 
+            .groups = "drop") |> 
+  group_by(state, year) |> 
+  summarise(mean_sst = mean(mean_sst), 
+            .groups = "drop")
+
+# temperature data for 2008 for each state
+sst_2008 <- 
+  state_sst |> 
+  filter(year == 2008) |> 
+  select(state, 
+         sst_2008 = mean_sst)
+
+# temeperature values relative to 2008
+state_sst_std <- 
+  state_sst |> 
+  left_join(sst_2008) |> 
+  mutate(year = as.numeric(year)) |> 
+  mutate(sst_std = mean_sst - sst_2008) 
+
+
+```
+
+
+# Population trends
+
+## Filling in NA values
+
+Due to the patchiness of the data, many sites have NA values where the
+site was not surveyed in a given year. To get the trends for a species
+through time, we have to make assumptions about the count within missing
+years. Firstly, we assume that if a species was surveyed in 2006 at
+site/source/method A and again in 2008 at the same
+site/source/method then the count in 2007 would be halfway between
+the two counts. We therefore linearly interpolate the NA values where
+there the species has been previously surveyed in the
+site/source/method, as well as surveyed in the future. We create a
+new column called `count_interp` for this raw count and interpolated
+counts combined.
+
+```{r interpolation}
+
+# Linear interpolation
+data_interp <-
+  data_basic |> 
+  group_by(transect_id, species_name) |> 
+  mutate(count_interp = zoo::na.approx(count_raw, na.rm = F)) |> 
+  ungroup()
+
+```
+
+
+```{r data-output02}
+#| include = FALSE
+
+if(save_csv){
+  
+  data_interp |> 
+    select(transect_id, 
+           species_name, 
+           year, 
+           count_interp) |> 
+    left_join(transect_tbl, by = "transect_id") |> 
+    select(-transect_id) |> 
+    pivot_wider(values_from = count_interp,
+                names_from = year)  |>
+    write_csv(file = here("output", "data", "poptrend02.csv"),
+              na = "")
+}
+```
+
+
+In years before the first survey, or after the last survey, it is not
+possible to interpolate the count value. We therefore make the
+assumption that the value will be equal to the closest true observation
+(count). E.g. if a 30 individuals were observed at the first survey at
+site/source/method A in 2000, then we assume 30 individuals were
+observed in the previous years.
+
+```{r extrapolation}
+
+# Extrapolation
+data_extrap <- 
+  data_interp |>
+  group_by(transect_id, species_name) |>
+  mutate(count_extrap = count_interp) |>
+  fill(count_extrap, .direction = "downup") |>
+  ungroup() 
+
+```
+
+
+```{r data-output03}
+#| include = FALSE
+
+if(save_csv){
+  
+  data_extrap |> 
+    select(transect_id, 
+           species_name, 
+           year, 
+           count_extrap) |> 
+    left_join(transect_tbl, by = "transect_id") |> 
+    select(-transect_id) |> 
+    pivot_wider(values_from = count_extrap,
+                names_from = year)  |>
+    write_csv(file = here("output", "data", "poptrend03.csv"),
+              na = "")
+}
+
+```
+
+## Dealing with zero counts
+
+Zero counts unlikely correspond to actually zero counts as we are only
+surveying a very small subset of the reef floor. The more transects we
+perform at a site/source/method, the greater the probability of
+detection of a species. We therefore want to replace zero counts with a
+minimal value, which we will use as the minimum count of a species at
+the given site in a given year. The minimum count will be dependent on
+the number of transects surveyed at at site in a given year, the more
+surveys, the lower the possible minimal count (1 observation across 5
+surveys is an average of 0.2 individuals per survey).
+
+We also wish to replace zero counts with a minimal value as will be
+later fitting a linear model to the log count of the species as a
+function of the year (i.e., the population trend). We create a new
+column called `count_mins` which is the minimum count at the site in
+that year.
+
+```{r minimum-counts}
+
+# Minimum non-zero count for the species at that site/source/method
+mincount_tbl_19922021 <-
+  data_extrap |> 
+  filter(count_extrap != 0) |> 
+  group_by(transect_id, species_name) |> 
+  summarise(mincount_9221 = min(count_extrap, na.rm = TRUE),
+            .groups = "drop") 
+
+# log(count) using mincount/2 when count is zero
+data_full <- 
+  data_extrap |>
+  left_join(mincount_tbl_19922021) |> 
+  mutate(count_extrap_nozeros = case_when(count_extrap == 0 ~ mincount_9221/2,
+                                          TRUE ~ count_extrap)) |> 
+  mutate(logcount_extrap = log(count_extrap_nozeros))
+
+```
+
+
+```{r data-output04}
+#| include = FALSE
+
+if(save_csv){
+  
+  data_full |> 
+    select(transect_id, 
+           species_name, 
+           year, 
+           mincount_9221,
+           logcount_extrap) |> 
+    left_join(transect_tbl, by = "transect_id") |> 
+    select(-transect_id) |> 
+    pivot_wider(values_from = logcount_extrap,
+                names_from = year)  |>
+    relocate(mincount_9221, .after = last_col()) |> 
+    write_csv(file = here("output", "data", "poptrend04.csv"),
+              na = "")
+}
+
+
+```
+
+# Visualising trends
+
+## Standardisation to 2008 count
+
+For plotting we want to look at the trends from 2008 onwards, we therefore want to use the log(count) from 2008 as a baseline. First we take the log(count) from each year and minus the log(count) for 2008 for that site/data-source/method combination.
+
+As we are visualising at the trends, we will be using the interpolated and extrapolated data, so that we do not have large jumps in the trends.
+
+```{r standardising-2008}
+
+# log(count) for 2008 (to be used as a baseline)
+data_full_2008 <-
+  data_full |> 
+  filter(year == 2008) |> 
+  select(
+    transect_id,
+    species_name, 
+    logcount_extrap_2008 = logcount_extrap
+  )
+
+# log(count) minus 2008 log(count)
+data_full_std <- 
+  data_full |> 
+  left_join(data_full_2008) |> 
+  mutate(logcount_extrap_std  = logcount_extrap - logcount_extrap_2008) |> 
+  filter(year >= 2008)
+
+```
+
+
+```{r data-output05}
+#| include = FALSE
+
+if(save_csv){
+  
+  data_full_std |> 
+    select(transect_id, 
+           species_name, 
+           year, 
+           logcount_extrap_2008,
+           logcount_extrap_std) |> 
+    left_join(transect_tbl, by = "transect_id") |> 
+    select(-transect_id) |> 
+    pivot_wider(values_from = logcount_extrap_std,
+                names_from = year) |>
+    relocate(logcount_extrap_2008, .after = last_col()) |> 
+    write_csv(file = here("output","data", "poptrend05.csv"),
+              na = "")
+}
+
+```
+
+
+## Geometric means
+
+To look at the mean trends at various grouping scales, we take the geometric mean:
+
+1.  Firstly we want to average over the 1°x1° latitude/longitude grid cells to remove the bias of the non-random placement of sites.
+
+```{r grid-meanlog}
+
+# Mean log(count) within 1°x1° grid cells
+logcount_latlonmean <- 
+  data_full_std |>
+  left_join(transect_tbl) |> 
+  group_by(latitude, longitude, state, species_name, year) |> 
+  summarise(mean_logcount = mean(logcount_extrap_std, na.rm = T), 
+            .groups = "drop")
+
+```
+
+
+```{r data-output06}
+#| include = FALSE
+
+if(save_csv){
+  
+  logcount_latlonmean |>  
+    pivot_wider(values_from = mean_logcount,
+                names_from = year) |> 
+    write_csv(file = here("output","data", "poptrend06.csv"),
+              na = "")
+}
+
+```
+
+
+2. We then take the mean for each species within each state
+
+```{r state-spp-meanlog}
+
+# state/species average
+logcount_bystate_byspp <- 
+  logcount_latlonmean |> 
+  group_by(state, species_name, year) |> 
+  summarise(mean_logcount = mean(mean_logcount, na.rm = T), 
+            .groups = "drop") |> 
+  left_join(species_tbl)
+
+
+
+```
+
+```{r data-output07}
+#| include = FALSE
+
+if(save_csv){
+  
+  logcount_bystate_byspp |>  
+    pivot_wider(values_from = mean_logcount,
+                names_from = year)|> 
+    write_csv(file = here("output","data", "poptrend07.csv"),
+              na = "")
+}
+
+```
+
+
+3.  We take the mean over all species in each biogeography and in each state
+
+```{r state-biogeog-meanlog}
+
+logcount_bystate_bybiogeog <- 
+  logcount_latlonmean |> 
+  left_join(species_tbl) |> 
+  group_by(state, biogeog, year) |> 
+  summarise(mean_logcount = mean(mean_logcount, na.rm = T), 
+            n = n(),
+            .groups = "drop")
+
+```
+
+```{r data-output08}
+#| include = FALSE
+
+if(save_csv){
+  
+  logcount_bystate_bybiogeog |> 
+    pivot_wider(values_from = mean_logcount,
+                names_from = year) |> 
+    write_csv(file = here("output","data", "poptrend08.csv"),
+              na = "")
+}
+
+```
+
+4.  Mean of taxon and biogeography
+
+```{r taxon-biogeog-meanlog}
+
+logcount_bytaxon_bybiogeog <- 
+  logcount_latlonmean |> 
+  left_join(species_tbl) |> 
+  group_by(biogeog, taxon, year) |> 
+  summarise(mean_logcount = mean(mean_logcount, na.rm = T), 
+            .groups = "drop") 
+
+
+
+
+```
+
+```{r data-output09}
+#| include = FALSE
+
+if(save_csv){
+  
+  logcount_bytaxon_bybiogeog |> 
+    pivot_wider(values_from = mean_logcount,
+                names_from = year) |>
+    write_csv(file = here("output","data", "poptrend09.csv"),
+              na = "")
+  
+  
+}
+
+```
+
+
+5.  Mean of state
+
+```{r state-meanlog}
+
+logcount_bystate <- 
+  logcount_latlonmean |> 
+  group_by(state, year) |> 
+  summarise(mean_logcount = mean(mean_logcount, na.rm = T), 
+            .groups = "drop") 
+
+
+
+```
+
+```{r data-output10}
+#| include = FALSE
+
+if(save_csv){
+  
+  logcount_bystate |> 
+    pivot_wider(values_from = mean_logcount,
+                names_from = year)  |>
+    write_csv(file = here("output","data", "poptrend10.csv"),
+              na = "")
+  
+  
+}
+
+```
+
+
+6.  Mean of state and taxon
+
+```{r state-taxon-meanlog}
+
+logcount_bystate_bytaxon <- 
+  logcount_latlonmean |> 
+  left_join(species_tbl) |> 
+  group_by(state, taxon, year) |> 
+  summarise(mean_logcount = mean(mean_logcount, na.rm = T), 
+            n = n(),
+            .groups = "drop") 
+
+```
+
+```{r data-output11}
+#| include = FALSE
+
+if(save_csv){
+  
+  logcount_bystate_bytaxon |> 
+    pivot_wider(values_from = mean_logcount,
+                names_from = year)  |>
+    write_csv(file = here("output","data", "poptrend11.csv"),
+              na = "")
+  
+}
+
+```
+
+
+7.  Mean of biogeography and 10° latitude bands
+
+```{r biogeog-10latbin-meanlog}
+
+# biogeography/10° latitude bin average
+logcount_bybiogeog_by10lat <- 
+  logcount_latlonmean |> 
+  mutate(lat_bin = case_when(
+    latitude <= -40 ~ "40+°S",
+    latitude <= -30 ~ "30°S - 40°S",
+    latitude <= -20 ~ "20°S - 30°S",
+    latitude <= -10 ~ "10°S - 20°S",
+  )) |> 
+  left_join(species_tbl) |> 
+  group_by(biogeog, lat_bin, year) |> 
+  summarise(mean = mean(mean_logcount, na.rm = T), 
+            sd = sd(mean_logcount, na.rm = T), 
+            n = n(),
+            .groups = "drop") |> 
+  mutate(se = (sd/sqrt(n))) 
+
+
+
+
+```
+
+```{r data-output12}
+#| include = FALSE
+
+if(save_csv){
+  
+  logcount_bybiogeog_by10lat |> 
+    select(-c(sd, n, se)) |> 
+    pivot_wider(values_from = mean,
+                names_from = year)  |>
+    write_csv(file = here("output","data", "poptrend12.csv"),
+              na = "")
+  
+}
+
+
+```
+
+
+
+## Figures
+
+Setting the colour scheme of the figures:
+
+```{r}
+
+# colours for each biogeography group
+biogeog_cols <- c(
+  Tropical = "#D62246", 
+  Warm = "#9204bbff",
+  Cool = "#0845f5ff"
+)
+
+# taxon colours
+taxon_cols <-
+  c(
+    Vertebrate = "#ffd600ff",
+    Macroalgae = "#006500ff",
+    Coral = "#ff7f4eff",
+    Invertebrate = "#a01feeff"
+  )
+
+grey_bkgrnd_col <- "#c6c6c6ff"
+
+```
+
+
+### Biogeography trends
+
+Let's plot the biogeography trends:
+
+```{r fig01}
+#| class.source = 'fold-hide'
+
+# Labels to be added to the figure titles
+state_tbl <- 
+  tibble(state = c("Northwest", 
+                   "Southwest",
+                   "South", 
+                   "Northeast", 
+                   "Southeast",
+                   "Tasmania"),
+         letter = LETTERS[1:6]) |> 
+  mutate(state_label = paste(letter, state, sep = ". "))
+
+
+# bit of a hack - to be used as y-axis label
+state_labs <- rep("Decadal change", 6)
+names(state_labs) <- state_tbl$state
+
+# correction factor to get dual axis
+# manually changed until looks good on axis
+correction_fct <- 2
+
+# applying the correction factor
+maxtemp_bystate <- 
+  state_sst_std |> 
+  group_by(state) |> 
+  summarise(maxsst = max(sst_std)) |> 
+  mutate(sst_edit = (maxsst+correction_fct)/correction_fct) |> 
+  select(state, sst_edit)
+
+# raw figure as facet
+fig01_raw <- 
+  logcount_bystate_bybiogeog |> 
+  filter(n >= 10) |> 
+  mutate(biogeog = factor(biogeog, 
+                          levels = c(
+                            "tropical", 
+                            "warm", 
+                            "cool"), 
+                          labels = c(
+                            "Tropical", 
+                            "Warm", 
+                            "Cool"),)) |> 
+  left_join(state_tbl, by = "state") |> 
+  ggplot() +
+  aes(x = year) +
+  # geoms
+  geom_rect(ymin = -Inf, 
+            ymax = 1, 
+            xmin = 2008, 
+            xmax = 2021, 
+            fill = grey_bkgrnd_col,
+            col = grey_bkgrnd_col) +
+  geom_path(aes(y = (sst_std+correction_fct)/correction_fct), 
+            data = state_sst_std, 
+            colour = "black", 
+            lty = 2) + 
+  geom_path(aes(y = exp(mean_logcount), 
+                col = biogeog), 
+            size = 1.5,
+            alpha = 0.8) + 
+  geom_text(x = 2008.5,
+            y = 0.65,
+            aes(label = state_label),
+            hjust = 0,
+            vjust = 0.5) +
+  ggforce::facet_col(vars(state), 
+                     scales = "free", 
+                     space = "free", 
+                     strip.position = "left", 
+                     labeller = labeller(state = state_labs)) +
+  # scales
+  scale_colour_manual(values = biogeog_cols) +
+  scale_y_continuous(labels = label_number(suffix = "x",
+                                           accuracy = 0.1),
+                     sec.axis = 
+                       sec_axis(
+                         trans = ~(.*correction_fct - correction_fct), 
+                         name = element_blank(),
+                         labels = number_format(suffix = "°C",
+                                                accuracy = 0.1, 
+                                                trim = FALSE),
+                         breaks = c(-0.5, 0, 0.5)),
+                     limits = c(0.6, NA),
+                     breaks = c(0.6, 0.8, 1, 1.2, 1.4, 1.6)
+  ) +
+  scale_x_continuous(labels = label_parse(),
+                     breaks = seq(2009, 2021, 3),
+                     expand = c(0,0)) +
+  coord_cartesian(clip = "off", 
+                  expand = TRUE) +
+  # themes
+  theme_minimal() +
+  theme(
+    title = element_blank(),
+    strip.background = element_blank(),
+    strip.placement = "outside",
+    axis.text = element_text(size = 12),
+    strip.text = element_text(size = 11),
+    panel.grid = element_blank(), 
+    panel.spacing = unit(1, "lines"), 
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    axis.text.y.right = element_text(colour = "black", hjust = 0.95),
+    axis.line = element_line(size = 1),
+    axis.ticks = element_line(size = 1),
+    plot.margin = margin(r = 10),
+    legend.margin = margin(t=-0,l=0,b=0,r=0.2, unit='cm'),
+    legend.background = element_rect(size = 0.5)) 
+
+# make figure into grob
+fig01_grob = ggplotGrob(fig01_raw)
+
+# assign each facet to an individual figure object
+for(i in 1:6){
+  
+  plot_height = 3
+  lower = (4*i)+1
+  upper = lower + plot_height
+  
+  p <-
+    fig01_grob[lower:upper,] |>
+    as_ggplot()
+  
+  
+  assign(paste0("p_", i), p)
+}
+
+# load the Australia shape file 
+aus_shpfile <- 
+  ggdraw() + 
+  image_read(here("input", "images", "aus_png.jpg")) |>
+  draw_image()
+
+# simple plot to extract legend from
+plot_temperature <- 
+  tibble(x = 1:10, y = 1:10) |> 
+  ggplot(aes(x = x, y = y, 
+             colour = "Temperature")) +
+  geom_path(lty = 2) +
+  scale_colour_manual(values = "black") +
+  theme(legend.position = "bottom", 
+        legend.title = element_blank(), 
+        legend.key = element_rect(fill = "transparent"),
+        legend.key.width = unit(1,"cm"),
+        legend.margin = margin(t=-0,l=0,b=0,r=0.2, unit='cm'),
+        legend.background = element_rect(size = 0.5, 
+                                         colour = "black"))
+
+# legend from simple temperature plot
+temperature_legend <-
+  plot_temperature |> 
+  get_legend() |> 
+  as_ggplot()
+
+# only the fig01 legend
+fig01_legend <- 
+  fig01_raw |> 
+  get_legend() |> 
+  as_ggplot()
+
+# layout for the overall figure
+layout <-
+  logcount_bystate_bybiogeog |> 
+  filter(n >= 10) |>
+  left_join(maxtemp_bystate) |> 
+  mutate(maxval = pmax(exp(mean_logcount), sst_edit)) |> 
+  group_by(state) |> 
+  summarise(max_log = max(maxval)) |>
+  mutate(figheight = 1.05*(round(max_log*100))-60) |> 
+  mutate(col = case_when(
+    str_detect(state, "west") ~ 1, 
+    str_detect(state, "east") ~ 3,
+    state == "South" ~ 1.5,
+    state == "Tasmania" ~ 2.5)) |> 
+  mutate(row = case_when(
+    str_detect(state, "North") ~ 1, 
+    state %in% c("South", "Tasmania") ~ 3,
+    str_detect(state, "South") ~ 2)) |> 
+  mutate(l = case_when(
+    col == 1 ~ 0, 
+    col == 2 ~ 30,
+    col == 1.5 ~ 12,
+    col == 2.5 ~ 48,
+    col == 3 ~ 60)) |> 
+  mutate(r = l + 30) |>  
+  mutate(t = (110*(row-1)+(110-figheight)/2), 
+         b = t+(figheight)) |> 
+  ungroup() |> 
+  bind_rows(tibble(state = "aus_shape",
+                   t = 10,
+                   b = 190,
+                   l = 30,
+                   r = 59)) |>
+  bind_rows(tibble(state = "legend1",
+                   t = 200,
+                   b = 210,
+                   l = 30,
+                   r = 58)) |>
+  bind_rows(tibble(state = "legend2",
+                   t = 215,
+                   b = 225,
+                   l = 30,
+                   r = 60)) |>
+  select(t,l,b,r) |> 
+  {\(x) area(t = x$t, 
+             l = x$l,
+             b = x$b,
+             r = x$r)}()
+
+
+# output figure
+fig01 <- 
+  p_1 + 
+  p_2 + 
+  p_3 + 
+  p_4 + 
+  p_5 + 
+  p_6 + 
+  aus_shpfile + 
+  fig01_legend +
+  temperature_legend +
+  plot_layout(design = layout)
+
+
+```
+
+
+
+```{r plot-output01}
+#| include = FALSE
+
+
+save_plot(filename = here("output", "figs", "fig01.png"), 
+          plot = fig01, 
+          base_height = 7)
+
+
+```
+
+Let's have a look at the figure
+
+```{r view-fig01}
+
+here("output", "figs", "fig01.png") |> knitr::include_graphics()
+
+```
+
+
+### Taxon trends
+
+```{r state-taxon-plot}
+#| class.source = 'fold-hide'
+
+# correction factor
+fig02_cor_fct <- 2
+
+fig02_maxtemp <- 
+  state_sst_std |> 
+  group_by(state) |> 
+  summarise(maxsst = max(sst_std)) |> 
+  mutate(sst_edit = (maxsst+fig02_cor_fct)/fig02_cor_fct) |> 
+  select(state, sst_edit)
+
+fig02_raw <- 
+  logcount_bystate_bytaxon %>% 
+  mutate(
+    state = factor(state, 
+                   levels = c("Northwest", 
+                              "Northeast", 
+                              "Southwest", 
+                              "Southeast", 
+                              "South", 
+                              "Tasmania"))) |>
+  left_join(state_tbl) |> 
+  ggplot(aes(as.numeric(year), 
+             mean_logcount + 1)) +
+  
+  geom_rect(ymin = -Inf, 
+            ymax = 1, 
+            xmin = 2008, 
+            xmax = 2021, 
+            fill = grey_bkgrnd_col,
+            col = grey_bkgrnd_col) +
+  geom_path(aes(colour = taxon), 
+            size = 1.5, 
+            alpha = 0.9) +
+  geom_path(aes(y = (sst_std+fig02_cor_fct)/fig02_cor_fct), 
+            data = state_sst_std, 
+            colour = "black", 
+            lty = 2, 
+            show.legend = FALSE) + 
+  geom_text(x = 2008.5, 
+            y = 0.65, 
+            aes(label = state_label),
+            hjust = 0, 
+            vjust = 0.5) +
+  scale_y_continuous(labels = label_number(suffix = "x",
+                                           accuracy = 0.1),
+                     sec.axis = 
+                       sec_axis(
+                         trans = ~ (.*fig02_cor_fct - fig02_cor_fct), 
+                         name = element_blank(),
+                         labels = label_number(suffix = "°C",
+                                               accuracy = 0.1)),
+                     limits = c(0.6, NA),
+                     breaks = c(0.6, 0.8, 1, 1.2, 1.4, 1.6)
+  ) +
+  ggforce::facet_col(vars(state), scales = "free", 
+                     space = "free", 
+                     strip.position = "left", 
+                     labeller = labeller(state = state_labs)) +
+  scale_color_manual(values = taxon_cols) +
+  scale_x_continuous(labels = label_parse(),
+                     breaks = seq(2009, 2021, 3),
+                     expand = c(0,0)) +
+  labs(x = "",
+       y = NULL) +
+  theme_minimal() +
+  theme(
+    strip.background = element_blank(),
+    strip.placement = "outside",
+    
+    panel.grid = element_blank(), 
+    panel.spacing = unit(1, "lines"), 
+    legend.position = "bottom",
+    axis.text.y.right = element_text(colour = "black", 
+                                     hjust = 0.95),
+    axis.text = element_text(size = 11),
+    strip.text = element_text(size = 10),
+    legend.title = element_blank(),
+    axis.line = element_line(size = 1),
+    axis.ticks = element_line(size = 1),
+    plot.margin = margin(r = 10),
+    legend.margin = margin(t=-0,l=0,b=0,r=0.2, unit='cm'),
+    legend.background = element_rect(size = 0.5)) 
+
+# p2
+
+fig02_grob = ggplotGrob(fig02_raw)
+
+# gtable_show_layout(g2)
+
+for(i in 1:6){
+  
+  plot_height = 3
+  lower = (4*i)+1
+  upper = lower + plot_height
+  
+  p <-
+    fig02_grob[lower:upper,] |>
+    as_ggplot()
+  
+  
+  assign(paste0("p2_", i), p)
+}
+
+fig02_legend <- 
+  fig02_raw |>
+  get_legend() |>
+  as_ggplot()
+
+fig02_layout <-
+  logcount_bystate_bytaxon |>
+  left_join(fig02_maxtemp) |> 
+  mutate(maxval = pmax(exp(mean_logcount), sst_edit)) |> 
+  group_by(state) |> 
+  summarise(max_log = max(maxval)) |>
+  mutate(figheight = 1.05*(round(max_log*100))-60) |> 
+  mutate(col = case_when(
+    str_detect(state, "west") ~ 1, 
+    str_detect(state, "east") ~ 3,
+    state == "South" ~ 1.5,
+    state == "Tasmania" ~ 2.5)) |> 
+  mutate(row = case_when(
+    str_detect(state, "North") ~ 1, 
+    state %in% c("South", "Tasmania") ~ 3,
+    str_detect(state, "South") ~ 2)) |> 
+  mutate(l = case_when(
+    col == 1 ~ 0, 
+    col == 2 ~ 30,
+    col == 1.5 ~ 12,
+    col == 2.5 ~ 48,
+    col == 3 ~ 60)) |> 
+  mutate(r = l + 30) |>  
+  mutate(t = (110*(row-1)+(110-figheight)/2), 
+         b = t+(figheight)) |> 
+  ungroup() |> 
+  bind_rows(tibble(state = "aus_shape",
+                   t = 10,
+                   b = 190,
+                   l = 30,
+                   r = 59)) |>
+  bind_rows(tibble(state = "legend1",
+                   t = 200,
+                   b = 210,
+                   l = 30,
+                   r = 58)) |>
+  bind_rows(tibble(state = "legend1",
+                   t = 215,
+                   b = 225,
+                   l = 30,
+                   r = 60)) |>
+  select(t,l,b,r) |> 
+  {\(x) area(t = x$t, 
+             l = x$l,
+             b = x$b,
+             r = x$r)}()
+
+
+fig02 <- 
+  p2_1 + 
+  p2_2 + 
+  p2_3 + 
+  p2_4 + 
+  p2_5 + 
+  p2_6 + 
+  aus_shpfile + 
+  fig02_legend + 
+  temperature_legend +
+  plot_layout(design = fig02_layout)
+
+```
+
+```{r plot-output02}
+#| include = FALSE
+
+
+save_plot(filename = here("output", "figs", "fig02.png"), 
+          plot = fig02, 
+          base_height = 7)
+
+
+```
+
+Let's have a look at the figure
+
+```{r view-fig02}
+
+here("output", "figs", "fig02.png") |> knitr::include_graphics()
+
+```
+
+
+
+
+
+```{r class.source = "fold-hide"}
+#| class.source = 'fold-hide'
+
+fig03 <- 
+  logcount_bybiogeog_by10lat|> 
+  filter(n >= 20) |> 
+  mutate(biogeog = factor(biogeog, 
+                          levels = c(
+                            "tropical", 
+                            "warm", 
+                            "cool"), 
+                          labels = c(
+                            "Tropical", 
+                            "Warm", 
+                            "Cool"),)) |> 
+  ggplot(aes(x = as.numeric(year), 
+             y = mean + 1, 
+             col = biogeog)) +
+  geom_rect(ymin = -Inf, 
+            ymax = 1, 
+            xmin = 2008, 
+            xmax = 2021, 
+            fill = grey_bkgrnd_col,
+            col = grey_bkgrnd_col) +
+  geom_segment(aes(x=2008,
+                   xend=2021,
+                   y=1,
+                   yend=1),
+               lty = 2,
+               colour = "grey50") +
+  geom_path(size = 1.5, 
+            alpha = 0.9) +
+  geom_path(aes(y = mean + 1 + se)) +
+  geom_path(aes(y = mean + 1 - se)) +
+  scale_colour_manual(values = biogeog_cols) +
+  facet_wrap(lat_bin~., scales = "free", ncol = 1) +
+  scale_y_continuous(labels = label_number(suffix = "x",
+                                           accuracy = 0.1),
+                     limits = c(0.5, 1.5)) +
+  scale_x_continuous(labels = label_parse(),
+                     breaks = seq(2009, 2021, 3), 
+                     expand = c(0,0)) +
+  geom_text(aes(x = 2008.5, 
+                y = 0.6, 
+                label = lat_bin),
+            check_overlap = TRUE,
+            show.legend = FALSE,
+            colour = "black", 
+            hjust = 0, 
+            fontface = "bold") +
+  labs(x = "",
+       y = "Decadal change") +
+  theme_minimal() +
+  theme(
+    plot.margin = margin(r = 10),
+    panel.grid = element_blank(), 
+    legend.position = "bottom",
+    legend.justification = c(0.5,0.5),
+    legend.title = element_blank(),
+    axis.line = element_line(size = 1),
+    axis.text = element_text(size = 11), 
+    axis.title = element_text(size = 18),
+    axis.ticks = element_line(size = 1),
+    strip.background = element_blank(),
+    strip.text = element_blank(),
+    legend.margin = margin(t=-0,l=0.1,b=0.1,r=0.2, unit='cm'),
+    legend.background = element_rect(size = 0.5)) 
+
+
+```
+
+```{r plot-output03}
+#| include = FALSE
+
+
+save_plot(filename = here("output", "figs", "fig03.png"), 
+          plot = fig03, 
+          base_height = 7, 
+          base_asp = 0.5)
+
+
+```
+
+Let's have a look at the figure
+
+```{r view-fig03}
+
+here("output", "figs", "fig03.png") |> knitr::include_graphics()
+
+```
+
+
+
+# Modelling trends
+
+## Linear models
+
+For the overall linear model we want a trend for each species. However, when
+taking the mean (e.g. across sites or protection status) we want to use
+the arithmetic mean of the interpolated and extrapolated count. Only
+before fitting a linear model do we want to log the mean count.
+
+1.  Mean count per 1°x1° latitude/longitude grid cells.
+
+```{r grid-mean}
+
+# Mean count within 1°x1° grid cells
+count_latlonmean <- 
+  data_full |>
+  filter(year >= 2011) |>
+  left_join(transect_tbl) |> 
+  left_join(species_tbl) |> 
+  group_by(latitude, longitude, taxon, species_name, year) |> 
+  summarise(mean_count = mean(count_extrap, na.rm = T), 
+            .groups = "drop")
+
+
+```
+
+```{r lm-output01}
+#| include = FALSE
+
+if(save_csv){
+  
+  count_latlonmean |> 
+    pivot_wider(values_from = mean_count,
+                names_from = year)  |>
+    write_csv(file = here("output","data", "linearmodel01.csv"),
+              na = "")
+  
+}
+
+```
+
+
+2. The trend for each species (count per species per year)
+
+```{r species-mean}
+
+# Mean count within species
+count_sppmean <- 
+  count_latlonmean |>
+  group_by(taxon, species_name, year) |> 
+  summarise(mean_count = mean(mean_count, na.rm = T), 
+            .groups = "drop")
+
+
+```
+
+```{r lm-output02}
+#| include = FALSE
+
+if(save_csv){
+  
+  count_sppmean |> 
+    pivot_wider(values_from = mean_count,
+                names_from = year)  |>
+    write_csv(file = here("output","data", "linearmodel02.csv"),
+              na = "")
+}
+
+```
+
+5. Log of the trends (using minimum value divided by two if zero)
+
+```{r}
+
+# mean count of the current data (2011-2021)
+spp_min_meancount <- 
+  count_sppmean |> 
+  group_by(species_name) |> 
+  filter(mean_count > 0) |> 
+  summarise(min_meancount = min(mean_count, na.rm = TRUE))
+
+# Mean count within species
+count_sppmean_log <- 
+  count_sppmean |> 
+  left_join(spp_min_meancount) |> 
+  mutate(log_meancount = case_when(mean_count == 0 ~ log(min_meancount/2),
+                                   TRUE ~ log(mean_count)))
+
+```
+
+```{r lm-output03}
+#| include = FALSE
+
+if(save_csv){
+  
+  count_sppmean_log |> 
+    select(taxon, species_name, year, min_meancount, log_meancount) |> 
+    pivot_wider(values_from = log_meancount,
+                names_from = year)  |>
+    write_csv(file = here("output","data", "linearmodel03.csv"),
+              na = "")
+}
+
+```
+
+4.  Linear model of the species trends
+
+```{r linear-model}
+
+# get the slope of the 2011-2021 data
+slopes_byspp <-
+  count_sppmean_log |> 
+  group_by(taxon, species_name) |> 
+  nest() |> 
+  mutate(lm     = map(data,   ~lm(.x$log_meancount ~ .x$year)),
+         slope  = map_dbl(lm, ~.x$coefficients[2]), 
+         r2     = map_dbl(lm, ~summary(.x)$r.squared),
+         adj_r2 = map_dbl(lm, ~summary(.x)$adj.r.squared), 
+         n = map_int(data, nrow)) |> 
+  select(-c(data, lm))
+
+```
+
+```{r lm-output04}
+#| include = FALSE
+
+if(save_csv){
+  
+  slopes_byspp  |>
+    write_csv(file = here("output","data", "linearmodel04.csv"),
+              na = "")
+  
+}
+
+```
+
+## Spearman's Rank 
+
+To test the statistical significance of the population trends, we want
+to analyse the raw data, i.e., not extrapolated or interpolated as these
+will make the observations not statistically independent and would bias
+the p-values.
+
+In the previous step, we logged the interpolated and extrapolated
+counts, we want to repeat this step but use the log of the raw count
+instead. We only care about the trends from 2008 to 2021, therefore we
+will exclude data pre-2008.
+
+```{r}
+
+# Minimum non-zero count for the species at that site/data-source/method
+mincount_tbl_20082021 <-
+  data_full |> 
+  filter(year >= 2008) |> 
+  filter(count_raw != 0) |> 
+  group_by(transect_id, species_name) |> 
+  summarise(mincount_0821 = min(count_raw, na.rm = TRUE),
+            .groups = "drop") 
+
+# log(raw count) using mincount/2 when count is zero
+data_lograw <- 
+  data_full |>
+  left_join(mincount_tbl_20082021) |> 
+  mutate(count_raw_nozeros = case_when(count_raw == 0 ~ mincount_0821/2,
+                                       TRUE ~ count_raw)) |> 
+  mutate(logcount_raw = log(count_raw_nozeros)) |> 
+  filter(year >= 2008) |> 
+  select(transect_id, 
+         species_name, 
+         year, 
+         count_raw, 
+         mincount_0821, 
+         count_raw_nozeros, 
+         logcount_raw)
+
+```
+
+
+```{r speamans-output0102}
+#| include = FALSE
+
+if(save_csv){
+  
+  # raw counts
+  data_lograw |> 
+    select(transect_id, 
+           species_name, 
+           year, 
+           mincount_0821, 
+           count_raw) |> 
+    left_join(transect_tbl) |> 
+    select(-transect_id) |> 
+    pivot_wider(values_from = count_raw,
+                names_from = year)  |>
+    relocate(mincount_0821, .after = last_col()) |> 
+    write_csv(file = here("output","data", "spearmans01.csv"),
+              na = "")
+  
+  # logged counts
+  data_lograw |> 
+    select(transect_id, 
+           species_name, 
+           year, 
+           mincount_0821, 
+           logcount_raw) |> 
+    left_join(transect_tbl) |> 
+    select(-transect_id) |> 
+    pivot_wider(values_from = logcount_raw,
+                names_from = year)  |>
+    relocate(mincount_0821, .after = last_col()) |> 
+    write_csv(file = here("output","data", "spearmans02.csv"),
+              na = "")
+}
+
+```
+
+### Standardise to the mean
+
+Each site and grid cell will have different mean values for the species,
+we therefore want to standardise the trends to the mean at the
+site/method combination.
+
+```{r standardise-mean}
+
+# mean count over the 2008 to 2021 period
+log_meancount <-
+  data_lograw |> 
+  group_by(transect_id, species_name) |> 
+  summarise(log_meancount_raw = mean(logcount_raw, na.rm = T) ,
+            .groups = "drop")
+
+
+# log(count) minus mean(log count) 
+logcount_meanstd <- 
+  data_lograw |> 
+  left_join(log_meancount) |> 
+  mutate(count_raw_std_logged = logcount_raw - log_meancount_raw) 
+
+
+```
+
+
+```{r speamans-output03}
+#| include = FALSE
+
+if(save_csv){
+  
+  logcount_meanstd |> 
+    select(transect_id, 
+           species_name, 
+           year, 
+           log_meancount_raw, 
+           count_raw_std_logged) |> 
+    left_join(transect_tbl) |> 
+    select(-transect_id) |> 
+    pivot_wider(values_from = count_raw_std_logged,
+                names_from = year)  |>
+    relocate(log_meancount_raw, .after = last_col()) |> 
+    write_csv(file = here("output","data", "spearmans03.csv"),
+              na = "")
+}
+
+```
+
+### Mean of standardised counts
+
+1.  Mean of the standardised by grid cell, and species
+
+```{r grid-meanraw}
+
+data_logcounts_std <- 
+  logcount_meanstd |> 
+  left_join(transect_tbl) |> 
+  group_by(latitude, longitude, species_name, year) |> 
+  summarise(meancount = mean(count_raw_std_logged, na.rm = T), 
+            .groups = "drop") |> 
+  mutate(meancount = ifelse(is.nan(meancount), NA, meancount))
+
+```
+
+```{r speamans-output04}
+#| include = FALSE
+
+if(save_csv){
+  
+  data_logcounts_std |> 
+    select(latitude, 
+           longitude, 
+           species_name, 
+           year, 
+           meancount) |> 
+    pivot_wider(values_from = meancount,
+                names_from = year)  |> 
+    write_csv(file = here("output","data", "spearmans04.csv"),
+              na = "")
+}
+
+
+```
+
+2.  Mean of the species
+
+```{r spp-meanraw}
+
+data_logcounts_std_sppyear <- 
+  data_logcounts_std |> 
+  group_by(species_name, year) |> 
+  summarise(meancount = mean(meancount, na.rm = T), 
+            .groups = "drop") |>   
+  mutate(meancount = ifelse(is.nan(meancount), NA, meancount)) 
+
+```
+
+```{r speamans-output05}
+#| include = FALSE
+
+if(save_csv){
+  
+  data_logcounts_std_sppyear |> 
+    left_join(species_tbl) |> 
+    select(taxon, 
+           species_name, 
+           year, 
+           meancount) |> 
+    pivot_wider(values_from = meancount,
+                names_from = year)  |> 
+    arrange(taxon) |> 
+    write_csv(file = here("output","data", "spearmans05.csv"),
+              na = "")
+}
+
+```
+
+Spearman's Rank correlation
+
+```{r spearmans}
+
+# Spearman's rank of the standardised log counts
+output_spearmans <- 
+  data_logcounts_std_sppyear |> 
+  group_by(species_name) |>
+  na.omit() |> 
+  nest() |> 
+  mutate(n_row = map_dbl(data, ~nrow(.x))) |> 
+  filter(n_row > 5) |>
+  mutate(
+    rho = map_dbl(data, ~cor(x = as.numeric(.x$year), 
+                             y = .x$meancount, 
+                             method = "spearman")),
+    pval = map_dbl(data, ~cor.test(as.numeric(.x$year), 
+                                   .x$meancount, 
+                                   method = "spearman")$p.val)
+  ) |> 
+  mutate(sig = case_when(pval <= 0.001 ~ "***",
+                         pval <= 0.01  ~ "**",
+                         pval <= 0.05  ~ "*",
+                         TRUE ~ "")) |> 
+  mutate(direction = case_when(sig != "" & rho > 0 ~ "up",
+                               sig != "" & rho < 0 ~ "down",
+                               TRUE ~ "")) |> 
+  select(-data)
+
+```
+
+```{r speamans-output06}
+#| include = FALSE
+
+if(save_csv){
+  
+  output_spearmans |> 
+    left_join(species_tbl) |> 
+    relocate(taxon) |> 
+    select(-biogeog) |> 
+    arrange(taxon) |> 
+    write_csv(file = here("output","data", "spearmans06.csv"),
+              na = "")
+}
+
+
+```
+
+How many species go up and how many down?
+
+```{r}
+
+output_spearmans |> 
+  ungroup() |> 
+  filter(pval <= 0.05) |> 
+  count(direction)
+
+```
+
+## Trend model outputs
+
+```{r final-output}
+
+final_output <- 
+  slopes_byspp |> 
+  select(taxon, species_name, slope) |> 
+  mutate(decade_change = exp(10*slope)) |> 
+  left_join(output_spearmans) |> 
+  select(-n_row)
+
+```
+
+```{r data-output-final}
+#| include = FALSE
+
+if(save_csv){
+  
+  final_output |> 
+    write_csv(file = here("output","data", "final_output.csv"),
+              na = "")
+}
+
+```
+
+
+
+```{r}
+#| class.source = 'fold-hide'
+
+# Mean slope per taxon per biogeography
+fig04_data_separated <-
+  final_output |> 
+  left_join(species_tbl) |> 
+  group_by(taxon, biogeog) |> 
+  summarise(y = mean(slope, na.rm = TRUE),
+            sd = sd(slope, na.rm = TRUE), 
+            n = n(),
+            .groups = "drop") |> 
+  mutate(ci = qnorm(.95)*(sd/sqrt(n))) |> 
+  filter(n > 1) |> # remove single points 
+  bind_rows(tibble(taxon = "All species", y = NA, biogeog = NA)) |> 
+  mutate(biogeog = factor(biogeog, 
+                          levels = c("tropical", "warm", "cool"),
+                          labels = c("Tropical", "Warm", "Cool"))) |> 
+  mutate(taxon = factor(taxon, 
+                        levels = c("All species",
+                                   "Coral",  
+                                   "Macroalgae", 
+                                   "Invertebrate",
+                                   "Vertebrate"),
+                        labels = c("All species",
+                                   "Coral",  
+                                   "Macroalgae", 
+                                   "Mobile invertebrates",
+                                   "Vertebrates")
+  )) |> 
+  mutate(uppr = y + ci,
+         lwr = y - ci) |> 
+  mutate(decade_change = exp(y*10),
+         decade_change_lwr = exp(lwr*10),
+         decade_change_uppr = exp(uppr*10))
+
+# Mean slope for all species combined
+fig04_data_allspp <-
+  final_output |> 
+  ungroup() |> 
+  left_join(species_tbl) |> 
+  summarise(y = mean(slope, na.rm = TRUE),
+            sd = sd(slope, na.rm = TRUE), 
+            n = n(),
+            .groups = "drop") |> 
+  mutate(ci = qnorm(.95)*(sd/sqrt(n))) |> 
+  mutate(taxon = "All species")|> 
+  mutate(uppr = y + ci,
+         lwr = y - ci) |> 
+  mutate(decade_change = exp(y*10),
+         decade_change_lwr = exp(lwr*10),
+         decade_change_uppr = exp(uppr*10))
+
+
+
+# make the downloaded SVGs silouhettes and assign to objects
+for(i in c("Coral", "Invertebrate", "Macroalgae", "Vertebrate")){
+  
+  img_tmp <- 
+    magick::image_read_svg(
+      here("input", "images", paste0(i, ".svg")), 
+      width = 1000) |> 
+    magick::image_quantize(colorspace = "gray") |> 
+    magick::image_colorize(opacity = 70, color = "black") 
+  
+  assign(paste0(i, "_svg"), img_tmp)
+  
+}
+
+fig04_raw <- 
+  fig04_data_separated |> 
+  ggplot() + 
+  aes(x = fct_cross(taxon, biogeog),
+      y = decade_change) +
+  geom_rect(ymin = -Inf, 
+            ymax = 1, 
+            xmin = -Inf, 
+            xmax = Inf, 
+            fill = grey_bkgrnd_col,
+            col = "transparent") +
+  # species separated by biogeography and taxon
+  geom_point(size = 4, aes(colour = biogeog)) +
+  geom_errorbar(aes(ymin = decade_change_lwr, 
+                    ymax = decade_change_uppr,
+                    colour = biogeog), 
+                width = 0.2,
+                show.legend = FALSE) +
+  geom_text(aes(y = decade_change_lwr - 0.01, label = n), 
+            vjust = 1) +
+  # all species combined
+  geom_point(size = 4, 
+             aes(x = taxon),
+             data = fig04_data_allspp) +
+  geom_errorbar(aes(ymin = decade_change_lwr, 
+                    ymax = decade_change_uppr, 
+                    x = taxon), 
+                width = 0.2,
+                show.legend = FALSE,
+                data = fig04_data_allspp) +
+  geom_text(aes(x = taxon, 
+                y = decade_change_lwr - 0.01, 
+                label = n), 
+            vjust = 1, 
+            data = fig04_data_allspp) +
+  scale_color_manual(values = biogeog_cols) +
+  facet_grid(~taxon, 
+             scales = "free_x", 
+             space = "free",
+             switch = "both",
+             labeller = label_wrap_gen(width=10)) +
+  scale_y_continuous(labels = label_number(suffix = "x", 
+                                           accuracy = 0.1), 
+                     breaks = seq(0.4, 1.6, 0.2)) +
+  labs(x = "",
+       y = "Decadal change") +
+  theme_minimal() +
+  theme(axis.title.x = element_blank(),
+        panel.grid = element_blank(), 
+        legend.position = c(0.95, 0.95),
+        legend.justification = c(1,1),
+        legend.title = element_blank(),
+        axis.text.y = element_text(size = 14),
+        axis.text.x = element_blank(),
+        axis.title.y = element_text(size = 18),
+        axis.line = element_line(size = 0.7),
+        axis.ticks = element_line(size = 0.7),
+        strip.placement = "outside",
+        strip.text = element_text(size = 12),
+        legend.margin = margin(t=-0,l=0.1,b=0.1,r=0.2, unit='cm'),
+        legend.background = element_rect(size = 0.5),
+        panel.spacing = unit(0.1, "lines")) 
+
+# adding the icons
+fig04 <-
+  ggdraw() +
+  draw_plot(fig04_raw) +
+  draw_image(image = Coral_svg,
+             x = 3.5/13, 
+             y = 0.8, 
+             scale = 0.15, 
+             hjust = 0.5, 
+             vjust = 0.5) +
+  draw_image(image = Macroalgae_svg,
+             x = 5.75/13, 
+             y = 0.8, 
+             scale = 0.2, 
+             hjust = 0.5, 
+             vjust = 0.5) +
+  draw_image(image = Invertebrate_svg,
+             x = 8.25/13, 
+             y = 0.8, 
+             scale = 0.15, 
+             hjust = 0.5, 
+             vjust = 0.5) +
+  draw_image(image = Vertebrate_svg,
+             x = 11.5/13, 
+             y = 0.7, 
+             scale = 0.15, 
+             hjust = 0.5, 
+             vjust = 0.5) 
+
+```
+
+
+```{r plot-output04}
+#| include = FALSE
+
+
+save_plot(filename = here("output", "figs", "fig04.png"), 
+          plot = fig04, 
+          base_height = 5)
+
+
+```
+
+Let's have a look at the figure
+
+```{r view-fig04}
+
+here("output", "figs", "fig04.png") |> knitr::include_graphics()
+
+```
+
+
+# Predicting decadal change
+
+```{r}
+
+frequency_tbl <-
+  data_clean |> 
+  select(site_id, species_name) |> 
+  distinct() |> 
+  count(species_name, 
+        name = "n_at_allsites")
+
+# NA values come from the rho/pval/sig columns from final_output
+allspp <- 
+  final_output |> 
+  left_join(species_tbl) |>
+  left_join(frequency_tbl) |> 
+  ungroup()
+
+
+```
+
+```{r model-tropfish}
+#| include = FALSE
+
+tropfish <- 
+  allspp |> 
+  filter(biogeog == "tropical",
+         taxon == "Vertebrate")
+
+# basic model
+lm1 <- 
+  tropfish |> 
+  lm(formula = 
+       decade_change ~
+       t_mean +
+       max_depth +
+       n_at_allsites +
+       max_length + 
+       lat_span_degrees
+  )
+
+# residuals are non-normally distributed
+lm1$residuals |> plot()
+lm1$residuals |> wilcox.test()
+
+# we need to log the decadal change
+lm2 <- update(lm1, log(decade_change)~.)
+
+# residuals are now approx normal
+lm2$residuals |> plot()
+lm2$residuals |> wilcox.test()
+
+# checking distribution of X variables
+tropfish |> pull(t_mean) |> plot()
+tropfish |> pull(max_depth) |> plot()
+tropfish |> pull(n_at_allsites) |> plot()
+tropfish |> pull(max_length) |> plot()
+tropfish |> pull(lat_span_degrees) |> plot()
+tropfish |> pull(chl_mean) |> plot()
+
+# transforming certain X variables
+tropfish |> pull(t_mean) |> plot()
+tropfish |> pull(max_depth) |> log() |> plot()
+tropfish |> pull(n_at_allsites) |> log() |> plot()
+tropfish |> pull(max_length) |> log() |> plot()
+tropfish |> pull(lat_span_degrees) |> plot()
+tropfish |> pull(chl_mean) |> log() |> plot()
+
+# histograms of transformed X variables
+tropfish |> pull(t_mean) |> hist()
+tropfish |> pull(max_depth) |> log() |> hist()
+tropfish |> pull(n_at_allsites) |> log() |> hist()
+tropfish |> pull(max_length) |> log() |> hist()
+tropfish |> pull(lat_span_degrees) |> hist()
+
+# the final model
+gls1 <- 
+  tropfish |> 
+  gls(model =  
+        log(decade_change) ~
+        scale(log(max_length)) +
+        scale(log(max_depth)) +
+        scale(lat_span_degrees) +
+        scale(log(n_at_allsites)) +
+        scale(t_mean),
+      weights = varIdent(form=~1|class)
+  )
+
+summary(gls1)
+plot(gls1)
+
+```
+
+```{r gls-model}
+#| class.source = 'fold-hide'
+
+
+# function to fit the gls
+fit_gls <- function(biogeography, taxon_group){
+  
+  mod <- 
+    allspp |> 
+    filter(biogeog == biogeography,
+           taxon   == taxon_group) |> 
+    gls(model =  
+          log(decade_change) ~
+          scale(log(max_length)) +
+          scale(log(max_depth)) +
+          scale(lat_span_degrees) +
+          scale(log(n_at_allsites)) +
+          scale(t_mean) +
+          scale(log(chl_mean)),
+        weights = varIdent(form=~1|class)
+    )
+  
+  confint_mod <-
+    mod |> 
+    confint(level  = 0.95) |> 
+    as_tibble(rownames = "term") |> 
+    clean_names()
+  
+  
+  mod |> 
+    summary() |>
+    {\(x) x$tTable}() |>
+    as_tibble(rownames = "term") |>
+    left_join(confint_mod, by = "term")
+  
+}
+
+# cleaning the names of the model terms
+label_tbl <- 
+  tibble(
+    term = c(
+      "scale(log(max_length))",
+      "scale(log(max_depth))",
+      "scale(lat_span_degrees)",
+      "scale(log(n_at_allsites))",
+      "scale(t_mean)",
+      "scale(log(chl_mean))",
+      "(Intercept)"
+    ),
+    axis_title = c( "Max. Length",
+                    "Max. Depth",
+                    "Lat. Span",
+                    "Frequency",
+                    "Temperature",
+                    "Chlorophyll",
+                    "Intercept")) |> 
+  rownames_to_column()
+
+gls_output <- 
+  expand_grid(biogeog = c("tropical",
+                          "warm",
+                          "cool"),
+              taxon = c("Vertebrate",
+                        "Invertebrate",
+                        "Coral",
+                        "Macroalgae")
+  ) |> 
+  filter(!(taxon == "Macroalgae" & biogeog == "tropical"),
+         !(taxon == "Coral" & biogeog != "tropical")) |> 
+  mutate(label = paste0(LETTERS[1:9], ". ", taxon)) |> 
+  mutate(model_out = map2(.x = biogeog, 
+                          .y = taxon, 
+                          .f = ~fit_gls(biogeography = .x, 
+                                        taxon_group = .y))) |> 
+  unnest(cols = c(model_out)) |> 
+  left_join(label_tbl, by = "term") |> 
+  mutate(axis_title = fct_reorder(axis_title, desc(rowname)))  |>
+  clean_names() |>
+  mutate(biogeog = factor(biogeog, 
+                          levels = c("tropical",
+                                     "warm",
+                                     "cool"),
+                          labels = c("Tropical",
+                                     "Warm",
+                                     "Cool"))) |>
+  mutate(taxon = factor(taxon, levels = c("Vertebrate",
+                                          "Invertebrate",
+                                          "Coral",
+                                          "Macroalgae"))) |> 
+  left_join(as_tibble(biogeog_cols, 
+                      rownames = "biogeog") |> 
+              rename(point_col = value), by = "biogeog") |> 
+  mutate(bkgrd = if_else(value < 0, grey_bkgrnd_col, "white"),
+         fill_col = if_else(p_value < 0.05, point_col, bkgrd))
+
+
+```
+
+
+```{r gls-plot}
+#| class.source = 'fold-hide'
+
+
+fig05 <- 
+  gls_output |> 
+  ggplot() +
+  aes(x = value, 
+      y = axis_title,  
+      col = biogeog, 
+      label = label) +
+  geom_rect(aes(xmin = -Inf,
+                xmax = 0,
+                ymin = -Inf,
+                ymax = Inf),
+            fill = grey_bkgrnd_col, 
+            col  = grey_bkgrnd_col) +
+  geom_vline(xintercept = 0, lty = 2) +
+  geom_segment(aes(x = x2_5_percent, 
+                   xend = x97_5_percent, 
+                   yend = axis_title),
+               size = 1.5, 
+               show.legend = FALSE) +
+  geom_point(size = 4, 
+             pch = 21,
+             stroke = 1.5, 
+             aes(fill = fill_col)) +
+  scale_fill_identity("fill_col") +
+  scale_colour_manual("biogeog", 
+                      values = biogeog_cols,
+                      guide = guide_legend(
+                        override.aes = list(pch = 19) )) +
+  facet_wrap(label~., 
+             scales = "free_x") +
+  guides(override.aes = list(pch = 19)) + 
+  theme_minimal() +
+  theme(
+    strip.text.x =  element_text(face = "bold", hjust = 0.5),
+    axis.title = element_blank(),
+    strip.background = element_blank(),
+    strip.placement = "none",
+    axis.text = element_text(size = 12),
+    strip.text = element_text(size = 12),
+    panel.grid = element_blank(),
+    panel.spacing = unit(1, "lines"),
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    axis.text.y.right = element_text(colour = "black", 
+                                     hjust = 0.95),
+    axis.line = element_line(size = 1),
+    axis.ticks = element_line(size = 1),
+    plot.margin = margin(r = 10, b = 5,  t = 5),
+    legend.margin = margin(t=-0,l=0,b=0,r=0.2, unit='cm'),
+    legend.background = element_rect(size = 0.5))
+
+```
+
+
+```{r plot-output05}
+#| include = FALSE
+
+
+save_plot(
+  filename = here("output", "figs", "fig05.png"), 
+  plot = fig05, 
+  base_height = 7)
+
+
+
+```
+
+Let's have a look at the figure
+
+```{r view-fig05}
+
+here("output", "figs", "fig05.png") |> knitr::include_graphics()
+
+```
+
+## Useful statistics
+
+### Count for each taxonomic class
+
+```{r}
+
+species_tbl |> 
+  count(class) |>
+  rename(Class = class,
+         `Number of species` = n) |> 
+  kable() |> 
+  kable_styling("striped", full_width = F, position = "center") 
+
+```
+
+
+
+```{r}
+
+cool_echinoderms_species <- 
+  species_tbl |> 
+  filter(class %in% c("Holothuroidea", 
+                      "Crinoidea",
+                      "Asteroidea",
+                      "Echinoidea")) |>
+  filter(biogeog == "cool") |> 
+  pull(species_name)
+
+warm_echinoids_species <- 
+  species_tbl |> 
+  filter(class %in% c("Echinoidea")) |> 
+  filter(biogeog == "warm") |> 
+  pull(species_name)
+
+cool_echinoderms_data <-
+  final_output |> 
+  left_join(species_tbl) |> 
+  filter(species_name %in% cool_echinoderms_species) |> 
+  mutate(taxon = "cool_echinoderms") 
+
+warm_echinoids_data <-
+  final_output |> 
+  left_join(species_tbl) |> 
+  filter(species_name %in% warm_echinoids_species) |> 
+  mutate(taxon = "warm_echonoids") 
+
+coral_spp_data <- 
+  final_output |> 
+  filter(taxon == "Coral") |> 
+  mutate(taxon = "all_corals") 
+
+specific_coral <- 
+  final_output |> 
+  filter(species_name == "Astreopora myriophthalma") |> 
+  mutate(taxon = "A_myriophthalma") 
+
+sig_coral_output <-
+  final_output |> 
+  filter(taxon == "Coral", pval < 0.05)
+
+all_macroalgae_data <- 
+  final_output |> 
+  filter(taxon == "Macroalgae") |> 
+  mutate(taxon = "all_macroalgae") 
+
+extra_data <- 
+  cool_echinoderms_data |> 
+  bind_rows(warm_echinoids_data) |> 
+  bind_rows(coral_spp_data) |> 
+  bind_rows(specific_coral) |> 
+  bind_rows(all_macroalgae_data) |> 
+  group_by(taxon, biogeog) |> 
+  summarise(y = mean(slope, na.rm = TRUE),
+            sd = sd(slope, na.rm = TRUE), 
+            n = n(),
+            .groups = "drop") |> 
+  mutate(ci = qnorm(.95)*(sd/sqrt(n))) |> 
+  mutate(uppr = y + ci,
+         lwr = y - ci) |> 
+  mutate(decade_change = exp(y*10),
+         decade_change_lwr = exp(lwr*10),
+         decade_change_uppr = exp(uppr*10)) 
+
+dec_places <- function(x, n = 2) format(round(x, n),  nsmall = n) |> as.numeric()
+
+fig04_data_separated |> 
+  select(taxon, decade_change,biogeog, n, decade_change_lwr, decade_change_uppr) |> 
+  filter(taxon != "All species") |> 
+  bind_rows(fig04_data_allspp |> 
+              select(taxon, decade_change,n, decade_change_lwr, decade_change_uppr)) |> 
+  bind_rows(extra_data |> select(taxon, decade_change,n, decade_change_lwr, decade_change_uppr)) |> 
+  mutate(decade_change_round = dec_places(decade_change), 
+         decade_change_lwr_round = dec_places(decade_change_lwr),
+         decade_change_uppr_round = dec_places(decade_change_uppr),
+         perc_change = (decade_change-1)*100) |> 
+  rename(n_species = n) |> 
+  write_csv("output/data/decade_change_values.csv")
+
+
+```
+
+
+### Mutivariate p-values
+
+```{r}
+#| class.source = 'fold-hide'
+
+gls_output |> 
+  mutate(sig = case_when(p_value <= 0.001 ~ "p<0.001 ***",
+                         p_value <= 0.01  ~ "p<0.01 **",
+                         p_value <= 0.05  ~ "p<0.05*",
+                         TRUE ~ "")) |>
+  mutate(direction = case_when(value == 0 & p_value <= 0.05 ~ "no change",
+                               value > 0 & p_value <= 0.05~ "increase",
+                               value < 0 & p_value <= 0.05~ "decrease")) |> 
+  # filter(p_value <= 0.055) |> # also show marginally significant
+  left_join(label_tbl) |> 
+  select(Biogeograpghy = biogeog, 
+         Taxon = taxon, 
+         Term = axis_title, 
+         p_value, 
+         Significance = sig, 
+         Direction = direction) |> 
+  write_csv("output/data/mutlivariate_output_values.csv")
+
+```
+
+### Decadal change values
+
+
+```{r}
+#| class.source = 'fold-hide'
+
+# values from fig01 in the paper
+fig04_data_separated |> 
+  filter(!is.na(biogeog)) |> 
+  bind_rows(fig04_data_allspp) |> 
+  bind_rows(extra_data) |> 
+  select(taxon, biogeog, starts_with("decade")) |> 
+  mutate(perc_change = (decade_change-1)*100) |> 
+  mutate(across(where(is.numeric), ~round(.x, 2)))|> 
+  kable() |> 
+  kable_styling("striped", full_width = F, position = "center") 
+
+
+```
+
+
+```{r}
+#| class.source = 'fold-hide'
+
+data_clean |> 
+  filter(species_name %in% sig_coral_output$species_name) |> 
+  mutate(count_type = case_when(count_raw == 0 ~ "zero",
+                                count_raw > 0 ~ "positive")) |> 
+  count(species_name, count_type) |> 
+  filter(!count_type |> is.na()) |> 
+  add_count(species_name, 
+            wt = n, 
+            name = "total_n") |> 
+  kable() |> 
+  kable_styling("striped", full_width = F, position = "center") 
+
+final_output |> 
+  filter(taxon == "Macroalgae", pval < 0.05) |> 
+  ungroup() |> 
+  count(direction)
+
+final_output |> 
+  filter(taxon == "Macroalgae") |> 
+  pull(slope) |> 
+  t.test()
+
+
+```
+
+### Number of sites surveyed
+
+```{r}
+
+test1 <- 
+  data_clean |> 
+  filter(!is.na(count_raw), 
+         year >= 2008) |> 
+  select(site_code, year) |> 
+  distinct() |> 
+  mutate(site_yr = paste(site_code, year))
+
+
+data_clean |> 
+  mutate(site_yr = paste(site_code, year)) |> 
+  filter(site_yr %!in% test1$site_yr) |> 
+  pull(site_code) |> unique()
+
+
+taxon_cols2 <-
+  c(
+    Vertebrates = "#ffd600ff",
+    Macroalgae = "#006500ff",
+    Coral = "#ff7f4eff",
+    "Mobile Invertebrates" = "#a01feeff"
+  )
+
+sitecode_pre2008 <- 
+  data_clean |> 
+  filter(!is.na(count_raw), 
+         year < 2008) |> 
+  pull(site_code) |> 
+  unique()
+
+extended_fig02 <- 
+  
+  data_clean |> 
+  filter(!is.na(count_raw), 
+         year >= 2008) |> 
+  select(site_code, taxon, year) |> 
+  distinct() |> 
+  count(taxon, site_code, name = "n_annual_survs") |> 
+  mutate(pre2008 = as.numeric(site_code %in% sitecode_pre2008)) |> 
+  mutate(n_annual_survs_edit = ifelse(n_annual_survs == 1, n_annual_survs + pre2008, n_annual_survs)) |> 
+  arrange(desc(n_annual_survs_edit)) |> 
+  count(taxon, n_annual_survs_edit, name = "n_sites") |> 
+  # filter(n_annual_survs_edit > 1) |> 
+  mutate(taxon = factor(taxon, 
+                        levels = c("Vertebrate", 
+                                   "Invertebrate",
+                                   "Macroalgae",
+                                   "Coral"),
+                        labels = c("Vertebrates",
+                                   "Mobile Invertebrates",
+                                   "Macroalgae",
+                                   "Coral")
+  )) |> 
+  ggplot(aes(x = n_annual_survs_edit, 
+             y = n_sites, 
+             fill = taxon)) +
+  geom_col(width = 0.6, 
+           position = position_dodge(width = 0.6, preserve = "single"), 
+           colour = "black") +
+  scale_fill_manual("taxon", 
+                    values = taxon_cols2) +
+  scale_x_continuous(breaks = pretty_breaks(), label = label_number(), expand = c(.01,.01)) +
+  scale_y_continuous(breaks = pretty_breaks(), label = label_number(), expand = c(.01,.01)) +
+  labs(x = "Number of annual surveys",
+       y = "Number of sites") +
+  theme_classic(20) +
+  theme(
+    # axis.text = element_text(size = 12),
+    legend.position = c(0.95,0.95),
+    legend.justification = c(1,1),
+    legend.title = element_blank(),
+    axis.text.y.right = element_text(colour = "black", 
+                                     hjust = 0.95),
+    axis.line = element_line(size = 1),
+    axis.ticks = element_line(size = 1),
+    plot.margin = margin(r = 10, b = 5,  t = 5),
+    legend.margin = margin(t=0,l=2,b=2,r=2, unit='mm'),
+    legend.background = element_rect(size = 0.5))
+
+save_plot(filename = here("output", "figs", "extended_fig02.png"), 
+          plot = extended_fig02, 
+          base_height = 7)
+
+```
+
+### Biogeography trends without interpolation
+
+```{r}
+
+state_bytransect <- 
+  data_clean |> 
+  select(transect_id, state) |> 
+  distinct()
+
+data_logcounts_std2 <- 
+  logcount_meanstd |> 
+  left_join(transect_tbl) |> 
+  group_by(latitude, longitude, state, species_name, year) |> 
+  summarise(meancount = mean(count_raw_std_logged, na.rm = T), 
+            .groups = "drop") |> 
+  mutate(meancount = ifelse(is.nan(meancount), NA, meancount))
+
+data_logcounts_std_sppyear2 <- 
+  data_logcounts_std2 |> 
+  group_by(species_name, state, year) |> 
+  summarise(meancount = mean(meancount, na.rm = T), 
+            .groups = "drop") |>   
+  mutate(meancount = ifelse(is.nan(meancount), NA, meancount)) 
+
+
+out1 <- 
+  data_logcounts_std_sppyear2 |> 
+  left_join(species_tbl) |> 
+  group_by(biogeog, state, year) |> 
+  summarise(meancount = mean(meancount, na.rm = T), 
+            .groups = "drop") |>   
+  mutate(meancount = ifelse(is.nan(meancount), NA, meancount)) 
+
+out1_2008 <- 
+  out1 |> 
+  filter(year == 2008) |> 
+  select(-year) |> 
+  rename(meancount_08 = meancount)
+
+logcount_bystate_bybiogeog_RAW <-
+  out1 |> 
+  left_join(out1_2008) |> 
+  mutate(meancount = exp(meancount),
+         meancount_08 = exp(meancount_08)) |> 
+  mutate(meancount_new = (meancount/meancount_08)) |> 
+  drop_na()
+
+# Labels to be added to the figure titles
+state_tbl <- 
+  tibble(state = c("Northwest", 
+                   "Southwest",
+                   "South", 
+                   "Northeast", 
+                   "Southeast",
+                   "Tasmania"),
+         letter = LETTERS[1:6]) |> 
+  mutate(state_label = paste(letter, state, sep = ". "))
+
+
+# bit of a hack - to be used as y-axis label
+state_labs <- rep("Decadal change", 6)
+names(state_labs) <- state_tbl$state
+
+# correction factor to get dual axis
+# manually changed until looks good on axis
+correction_fct <- 2
+
+# applying the correction factor
+maxtemp_bystate <- 
+  state_sst_std |> 
+  group_by(state) |> 
+  summarise(maxsst = max(sst_std)) |> 
+  mutate(sst_edit = (maxsst+correction_fct)/correction_fct) |> 
+  select(state, sst_edit)
+
+# raw figure as facet
+extended_fig03_raw <- 
+  logcount_bystate_bybiogeog_RAW |> 
+  # filter(n >= 10) |> 
+  mutate(biogeog = factor(biogeog, 
+                          levels = c(
+                            "tropical", 
+                            "warm", 
+                            "cool"), 
+                          labels = c(
+                            "Tropical", 
+                            "Warm", 
+                            "Cool"),)) |> 
+  left_join(state_tbl, by = "state") |> 
+  ggplot() +
+  aes(x = year) +
+  # geoms
+  geom_rect(ymin = -Inf, 
+            ymax = 1, 
+            xmin = 2008, 
+            xmax = 2021, 
+            fill = grey_bkgrnd_col,
+            col = grey_bkgrnd_col) +
+  geom_path(aes(y = (sst_std+correction_fct)/correction_fct), 
+            data = state_sst_std, 
+            colour = "black", 
+            lty = 2) + 
+  geom_path(aes(y = meancount_new, 
+                col = biogeog), 
+            size = 1.5,
+            alpha = 0.8) + 
+  geom_text(x = 2008.5,
+            y = 0.65,
+            aes(label = state_label),
+            hjust = 0,
+            vjust = 0.5) +
+  ggforce::facet_col(vars(state), 
+                     scales = "free", 
+                     space = "free", 
+                     strip.position = "left", 
+                     labeller = labeller(state = state_labs)) +
+  # scales
+  scale_colour_manual(values = biogeog_cols) +
+  scale_y_continuous(labels = label_number(suffix = "x",
+                                           accuracy = 0.1),
+                     sec.axis = 
+                       sec_axis(
+                         trans = ~(.*correction_fct - correction_fct), 
+                         name = element_blank(),
+                         labels = number_format(suffix = "°C",
+                                                accuracy = 0.1, 
+                                                trim = FALSE),
+                         breaks = c(-0.5, 0, 0.5)),
+                     limits = c(0.6, NA),
+                     breaks = c(0.6, 0.8, 1, 1.2, 1.4, 1.6)
+  ) +
+  scale_x_continuous(labels = label_parse(),
+                     breaks = seq(2009, 2021, 3),
+                     expand = c(0,0)) +
+  coord_cartesian(clip = "off", 
+                  expand = TRUE) +
+  # themes
+  theme_minimal() +
+  theme(
+    title = element_blank(),
+    strip.background = element_blank(),
+    strip.placement = "outside",
+    axis.text = element_text(size = 12),
+    strip.text = element_text(size = 11),
+    panel.grid = element_blank(), 
+    panel.spacing = unit(1, "lines"), 
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    axis.text.y.right = element_text(colour = "black", hjust = 0.95),
+    axis.line = element_line(size = 1),
+    axis.ticks = element_line(size = 1),
+    plot.margin = margin(r = 10),
+    legend.margin = margin(t=-0,l=0,b=0,r=0.2, unit='cm'),
+    legend.background = element_rect(size = 0.5)) 
+
+# make figure into grob
+extended_fig03_grob = ggplotGrob(extended_fig03_raw)
+
+# assign each facet to an individual figure object
+for(i in 1:6){
+  
+  plot_height = 3
+  lower = (4*i)+1
+  upper = lower + plot_height
+  
+  p <-
+    extended_fig03_grob[lower:upper,] |>
+    as_ggplot()
+  
+  
+  assign(paste0("p_", i), p)
+}
+
+# only the extended_fig03 legend
+extended_fig03_legend <- 
+  extended_fig03_raw |> 
+  get_legend() |> 
+  as_ggplot()
+
+# layout for the overall figure
+layout <-
+  logcount_bystate_bybiogeog_RAW |> 
+  # filter(n >= 10) |>
+  left_join(maxtemp_bystate) |> 
+  mutate(maxval = pmax(meancount_new, sst_edit)) |> 
+  group_by(state) |> 
+  summarise(max_log = max(maxval)) |>
+  mutate(figheight = 1.05*(round(max_log*100))-60) |> 
+  mutate(col = case_when(
+    str_detect(state, "west") ~ 1, 
+    str_detect(state, "east") ~ 3,
+    state == "South" ~ 1.5,
+    state == "Tasmania" ~ 2.5)) |> 
+  mutate(row = case_when(
+    str_detect(state, "North") ~ 1, 
+    state %in% c("South", "Tasmania") ~ 3,
+    str_detect(state, "South") ~ 2)) |> 
+  mutate(l = case_when(
+    col == 1 ~ 0, 
+    col == 2 ~ 30,
+    col == 1.5 ~ 12,
+    col == 2.5 ~ 48,
+    col == 3 ~ 60)) |> 
+  mutate(r = l + 30) |>  
+  mutate(t = (110*(row-1)+(110-figheight)/2), 
+         b = t+(figheight)) |> 
+  ungroup() |> 
+  bind_rows(tibble(state = "aus_shape",
+                   t = 10,
+                   b = 190,
+                   l = 30,
+                   r = 59)) |>
+  bind_rows(tibble(state = "legend1",
+                   t = 200,
+                   b = 210,
+                   l = 30,
+                   r = 58)) |>
+  bind_rows(tibble(state = "legend2",
+                   t = 215,
+                   b = 225,
+                   l = 30,
+                   r = 60)) |>
+  select(t,l,b,r) |> 
+  {\(x) area(t = x$t, 
+             l = x$l,
+             b = x$b,
+             r = x$r)}()
+
+
+# output figure
+extended_fig03 <- 
+  p_1 + 
+  p_2 + 
+  p_3 + 
+  p_4 + 
+  p_5 + 
+  p_6 + 
+  aus_shpfile + 
+  extended_fig03_legend +
+  temperature_legend +
+  plot_layout(design = layout)
+
+
+save_plot(filename = here("output", "figs", "extended_fig03.png"), 
+          plot = extended_fig03, 
+          base_height = 7)
+
+```
+
+# Sensitivity analysis
+
+```{r}
+
+
+plot_sensitivity <- function(nsurvs, remove_x_axis = FALSE){
+ 
+    site_code_tokeep <- 
+    data_clean |> 
+    filter(!is.na(count_raw), 
+           year >= 2008) |> 
+    select(site_code, taxon, year) |> 
+    distinct() |> 
+    count(taxon, site_code, name = "n_annual_survs") |> 
+    mutate(pre2008 = as.numeric(site_code %in% sitecode_pre2008)) |> 
+    mutate(n_annual_survs_edit = ifelse(n_annual_survs == 1, n_annual_survs + pre2008, n_annual_survs)) |> 
+    filter(n_annual_survs_edit >= nsurvs)  |> 
+    pull(site_code) |> 
+    unique()
+  
+  total_site_codes <-
+    data_clean |> 
+    filter(!is.na(count_raw), 
+           year >= 2008) |> 
+    select(site_code, year) |> 
+    distinct() |> 
+    count(site_code) |> 
+    pull(site_code) |> 
+    unique()
+  
+  perc_transid <- (length(site_code_tokeep)*100/length(total_site_codes)) |> round(1)
+  
+  count_latlonmean <- 
+    data_full |>
+    filter(year >= 2011) |>
+    left_join(transect_tbl) |> 
+    left_join(species_tbl) |> 
+    # mutate(site_id = paste(site_code, data, sep = "_")) |> 
+    filter(site_code %in% site_code_tokeep) |> 
+    group_by(latitude, longitude, taxon, species_name, year) |> 
+    summarise(mean_count = mean(count_extrap, na.rm = T), 
+              .groups = "drop")
+  
+  count_sppmean <- 
+    count_latlonmean |>
+    group_by(taxon, species_name, year) |> 
+    summarise(mean_count = mean(mean_count, na.rm = T), 
+              .groups = "drop")
+  
+  spp_min_meancount <- 
+    count_sppmean |> 
+    group_by(species_name) |> 
+    filter(mean_count > 0) |> 
+    summarise(min_meancount = min(mean_count, na.rm = TRUE))
+  
+  # Mean count within species
+  count_sppmean_log <- 
+    count_sppmean |> 
+    left_join(spp_min_meancount) |> 
+    mutate(log_meancount = case_when(mean_count == 0 ~ log(min_meancount/2),
+                                     TRUE ~ log(mean_count)))
+  
+  slopes_byspp <-
+    count_sppmean_log |> 
+    group_by(taxon, species_name) |> 
+    nest() |> 
+    mutate(lm     = map(data,   ~lm(.x$log_meancount ~ .x$year)),
+           slope  = map_dbl(lm, ~.x$coefficients[2]), 
+           r2     = map_dbl(lm, ~summary(.x)$r.squared),
+           adj_r2 = map_dbl(lm, ~summary(.x)$adj.r.squared), 
+           n = map_int(data, nrow)) |> 
+    select(-c(data, lm))
+  
+  
+  # Mean slope per taxon per biogeography
+  fig04_data_separated <-
+    slopes_byspp |> 
+    left_join(species_tbl) |> 
+    group_by(taxon, biogeog) |> 
+    summarise(y = mean(slope, na.rm = TRUE),
+              sd = sd(slope, na.rm = TRUE), 
+              n = n(),
+              .groups = "drop") |> 
+    mutate(ci = qnorm(.95)*(sd/sqrt(n))) |> 
+    filter(n > 1) |> # remove single points 
+    bind_rows(tibble(taxon = "All species", y = NA, biogeog = NA)) |> 
+    mutate(biogeog = factor(biogeog, 
+                            levels = c("tropical", "warm", "cool"),
+                            labels = c("Tropical", "Warm", "Cool"))) |> 
+    mutate(taxon = factor(taxon, 
+                          levels = c("All species",
+                                     "Coral",  
+                                     "Macroalgae", 
+                                     "Invertebrate",
+                                     "Vertebrate"),
+                          labels = c("All species",
+                                     "Coral",  
+                                     "Macroalgae", 
+                                     "Mobile invertebrates",
+                                     "Vertebrates")
+    )) |> 
+    mutate(uppr = y + ci,
+           lwr = y - ci) |> 
+    mutate(decade_change = exp(y*10),
+           decade_change_lwr = exp(lwr*10),
+           decade_change_uppr = exp(uppr*10))
+  
+  # Mean slope for all species combined
+  fig04_data_allspp <-
+    slopes_byspp |> 
+    ungroup() |> 
+    left_join(species_tbl) |> 
+    summarise(y = mean(slope, na.rm = TRUE),
+              sd = sd(slope, na.rm = TRUE), 
+              n = n(),
+              .groups = "drop") |> 
+    mutate(ci = qnorm(.95)*(sd/sqrt(n))) |> 
+    mutate(taxon = "All species")|> 
+    mutate(uppr = y + ci,
+           lwr = y - ci) |> 
+    mutate(decade_change = exp(y*10),
+           decade_change_lwr = exp(lwr*10),
+           decade_change_uppr = exp(uppr*10))
+  
+  
+  
+  # make the downloaded SVGs silouhettes and assign to objects
+  for(i in c("Coral", "Invertebrate", "Macroalgae", "Vertebrate")){
+    
+    img_tmp <- 
+      magick::image_read_svg(
+        here("input", "images", paste0(i, ".svg")), 
+        width = 1000) |> 
+      magick::image_quantize(colorspace = "gray") |> 
+      magick::image_colorize(opacity = 70, color = "black") 
+    
+    assign(paste0(i, "_svg"), img_tmp)
+    
+  }
+  
+  fig04_raw <- 
+    fig04_data_separated |> 
+    ggplot() + 
+    aes(x = fct_cross(taxon, biogeog),
+        y = decade_change) +
+    geom_rect(ymin = -Inf, 
+              ymax = 1, 
+              xmin = -Inf, 
+              xmax = Inf, 
+              fill = grey_bkgrnd_col,
+              col = "transparent") +
+    # species separated by biogeography and taxon
+    geom_point(size = 3, aes(colour = biogeog)) +
+    geom_errorbar(aes(ymin = decade_change_lwr, 
+                      ymax = decade_change_uppr,
+                      colour = biogeog), 
+                  width = 0.2,
+                  show.legend = FALSE) +
+    geom_text(aes(y = decade_change_lwr - 0.01, label = n), 
+              vjust = 1) +
+    # all species combined
+    geom_point(size = 3, 
+               aes(x = taxon),
+               data = fig04_data_allspp) +
+    geom_errorbar(aes(ymin = decade_change_lwr, 
+                      ymax = decade_change_uppr, 
+                      x = taxon), 
+                  width = 0.2,
+                  show.legend = FALSE,
+                  data = fig04_data_allspp) +
+    geom_text(aes(x = taxon, 
+                  y = decade_change_lwr - 0.01, 
+                  label = n), 
+              vjust = 1, 
+              data = fig04_data_allspp) +
+    scale_color_manual(values = biogeog_cols) +
+    facet_grid(~taxon, 
+               scales = "free_x", 
+               space = "free",
+               switch = "both",
+               labeller = label_wrap_gen(width=10)) +
+    scale_y_continuous(labels = label_number(suffix = "x", 
+                                             accuracy = 0.1), 
+                       breaks = seq(0.4, 1.8, 0.2)) +
+    coord_cartesian(ylim = c(0.5, 1.7)) +
+    labs(x = "",
+         y = "Decadal change", 
+         title = paste0("Sites with trends based on ", nsurvs, " or more surveys (", perc_transid, "% all sites)")) +
+    theme_minimal() +
+    theme(axis.title.x = element_blank(),
+          panel.grid = element_blank(), 
+          # legend.position = "none",
+          # legend.position = c(0.95, 0.95),
+          # legend.justification = c(1,1),
+          legend.position = "none",
+          legend.title = element_blank(),
+          axis.text.y = element_text(size = 14),
+          axis.text.x = element_blank(),
+          axis.title.y = element_text(size = 18),
+          axis.line = element_line(size = 0.7),
+          axis.ticks = element_line(size = 0.7),
+          strip.placement = "outside",
+          strip.text = element_text(size = 12),
+          # legend.margin = margin(t=-0,l=0.1,b=0.1,r=0.2, unit='cm'),
+          # legend.background = element_rect(size = 0.5),
+          panel.spacing = unit(0.1, "lines")) +
+    {if(remove_x_axis) theme(strip.text = element_blank())}
+  
+  # adding the icons
+  ggdraw() +
+    draw_plot(fig04_raw) +
+    draw_image(image = Coral_svg,
+               x = 3.5/13, 
+               y = 0.8, 
+               scale = 0.15, 
+               hjust = 0.5, 
+               vjust = 0.5) +
+    draw_image(image = Macroalgae_svg,
+               x = 5.75/13, 
+               y = 0.8, 
+               scale = 0.2, 
+               hjust = 0.5, 
+               vjust = 0.5) +
+    draw_image(image = Invertebrate_svg,
+               x = 8.25/13, 
+               y = 0.8, 
+               scale = 0.15, 
+               hjust = 0.5, 
+               vjust = 0.5) +
+    draw_image(image = Vertebrate_svg,
+               x = 11.5/13, 
+               y = 0.7, 
+               scale = 0.15, 
+               hjust = 0.5, 
+               vjust = 0.5) 
+}
+
+for_legend_only <- 
+  fig04_data_separated |> 
+  ggplot() + 
+  aes(x = fct_cross(taxon, biogeog),
+      y = decade_change) +
+  geom_point(size = 4, aes(colour = biogeog)) +
+  scale_color_manual(values = biogeog_cols) +
+  theme_minimal() +
+  theme(legend.position = "bottom",
+        legend.title = element_blank(),
+        legend.margin = margin(t=-0,l=0.1,b=0.1,r=0.2, unit='cm'),
+        legend.background = element_rect(size = 0.5)) 
+
+legend_b <- 
+  for_legend_only |> 
+  get_legend() |> 
+  as_ggplot()
+
+# p1 <- plot_sensitivity(2)
+
+p_sens <-
+  plot_grid(
+    plot_sensitivity(2, remove_x_axis = TRUE),
+    plot_sensitivity(3, remove_x_axis = TRUE),
+    plot_sensitivity(4), 
+    rel_heights = c(1, 1, 1.1),
+    ncol = 1, 
+    labels = "AUTO"
+  ) |> 
+  plot_grid(legend_b, ncol = 1, rel_heights = c(1, .1))
+
+save_plot(filename = here("output", "figs", "sensitivity_analysis.png"), 
+          plot = p_sens, 
+          base_height = 11, 
+          base_asp = 0.6 )
+
+```
