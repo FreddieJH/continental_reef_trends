@@ -1815,7 +1815,8 @@ final_output <-
   select(taxon, species_name, slope) |> 
   mutate(decade_change = exp(10*slope)) |> 
   left_join(output_spearmans) |> 
-  select(-n_row)
+  select(-n_row) |> 
+  ungroup()
 
 ```
 
@@ -1830,7 +1831,6 @@ if(save_csv){
 }
 
 ```
-
 
 
 ```{r}
@@ -2113,7 +2113,6 @@ plot(gls1)
 ```{r gls-model}
 #| class.source = 'fold-hide'
 
-
 # function to fit the gls
 fit_gls <- function(biogeography, taxon_group){
   
@@ -2290,18 +2289,75 @@ here("output", "figs", "fig05.png") |> knitr::include_graphics()
 
 ## Useful statistics
 
-### Count for each taxonomic class
+### Percentage of declining species
 
 ```{r}
 
-species_tbl |> 
-  count(class) |>
-  rename(Class = class,
-         `Number of species` = n) |> 
-  kable() |> 
-  kable_styling("striped", full_width = F, position = "center") 
+# percentage of declining species from significant values
+final_output |> 
+  filter(pval < 0.05) |> 
+  count(direction) |> 
+  pivot_wider(names_from = direction, values_from = n) |> 
+  mutate(percent_decline = down/(down+up)*100)
+
+# percentage of declining species from significant values
+final_output |> 
+  mutate(trend = ifelse(slope < 0, "dec", "inc")) |> 
+  count(trend) |> 
+  pivot_wider(names_from = trend, values_from = n) |> 
+  mutate(percent_decline = dec/(dec+inc)*100)
+
+# declines more than 30% by taxon
+final_output |> 
+  filter(decade_change < 0.7) |> 
+  count(taxon)
+
+# total number of species declining by at least 30%
+final_output |> 
+  mutate(trend_30perc = ifelse(decade_change < 0.7, "perc30dec", "not")) |> 
+  count(trend_30perc) |> 
+  pivot_wider(names_from = trend_30perc, values_from = n) |> 
+  mutate(percent_decline = perc30dec/(perc30dec+not)*100)
+
+# weedy seadragon numbers
+final_output |> 
+  filter(species_name == "Phyllopteryx taeniolatus") |> 
+  mutate(perc_change = (1-decade_change)*100)
+
+# >80% decline 
+final_output |>
+  filter(decade_change < 0.2) |> 
+  nrow()
+
+# >50% decline
+final_output |>
+  filter(decade_change < 0.5, 
+         decade_change >= 0.2) |> 
+  nrow()
+
+# >30% decline
+final_output |>
+  filter(decade_change < 0.7, 
+         decade_change >= 0.5) |> 
+  nrow()
+
+
+# how mnay macroalgal species decline and increased?
+final_output |> 
+  filter(taxon == "Macroalgae") |> 
+  filter(pval <0.05) |> 
+  count(direction)
+
+
+final_output |> 
+  left_join(species_tbl) |>
+    filter(taxon == "Vertebrate",
+         biogeog == "tropical") |> 
+  count(class)
 
 ```
+
+### Percent change over the decade
 
 
 
@@ -2341,8 +2397,9 @@ coral_spp_data <-
 
 specific_coral <- 
   final_output |> 
-  filter(species_name == "Astreopora myriophthalma") |> 
-  mutate(taxon = "A_myriophthalma") 
+  filter(taxon == "Coral",
+         pval < 0.05) |> 
+  mutate(taxon = species_name)
 
 sig_coral_output <-
   final_output |> 
@@ -2382,12 +2439,31 @@ fig04_data_separated |>
   mutate(decade_change_round = dec_places(decade_change), 
          decade_change_lwr_round = dec_places(decade_change_lwr),
          decade_change_uppr_round = dec_places(decade_change_uppr),
-         perc_change = (decade_change-1)*100) |> 
+         perc_change = (decade_change-1)*100,
+         perc_change_upr = (decade_change_uppr-1)*100,
+         perc_change_lwr = (decade_change_lwr-1)*100) |> 
   rename(n_species = n) |> 
   write_csv("output/data/decade_change_values.csv")
 
 
 ```
+
+
+
+
+### Species count
+
+```{r}
+
+species_tbl |> 
+  count(class) |>
+  rename(Class = class,
+         `Number of species` = n) |> 
+  kable() |> 
+  kable_styling("striped", full_width = F, position = "center") 
+
+```
+
 
 
 ### Mutivariate p-values
