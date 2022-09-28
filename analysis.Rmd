@@ -96,11 +96,11 @@ species_tbl <-
            show_col_types = FALSE, 
            skip_empty_rows = TRUE) 
 
-# temperature timeseries (post-2008) data for each site
+# temperature time-series (post-2008) data for each site
 temperature_raw <- 
   read_csv(file =  here("input", "data", "temperature_timeseries.csv"),
            show_col_types = FALSE, 
-           skip_empty_rows = TRUE)  
+           skip_empty_rows = TRUE)
 
 ```
 
@@ -132,7 +132,6 @@ data_raw_wide |>
 
 ```
 
-
 ## Convert to long-format
 
 For the analysis, we want the data in a long (aka. tidy) format - a
@@ -158,7 +157,7 @@ data_raw_long <-
   ) |> 
   # all zero's become NA
   mutate(count_raw = case_when(count_raw == 0 & taxon == "Macroalgae" ~ NA_real_,
-                                TRUE ~ count_raw))
+                               TRUE ~ count_raw))
 
 ```
 
@@ -1435,6 +1434,7 @@ count_latlonmean <-
   left_join(species_tbl) |> 
   group_by(latitude, longitude, taxon, species_name, year) |> 
   summarise(mean_count = mean(count_extrap, na.rm = T), 
+            n = n(), 
             .groups = "drop")
 
 
@@ -1465,6 +1465,7 @@ count_sppmean <-
   count_latlonmean |>
   group_by(taxon, species_name, year) |> 
   summarise(mean_count = mean(mean_count, na.rm = T), 
+            n = sum(n), 
             .groups = "drop")
 
 
@@ -1530,10 +1531,14 @@ slopes_byspp <-
   nest() |> 
   mutate(lm     = map(data,   ~lm(.x$log_meancount ~ .x$year)),
          slope  = map_dbl(lm, ~.x$coefficients[2]), 
+         slope_error = map_dbl(lm, ~summary(.x)$coefficients[2, 2]),
          r2     = map_dbl(lm, ~summary(.x)$r.squared),
          adj_r2 = map_dbl(lm, ~summary(.x)$adj.r.squared), 
          n = map_int(data, nrow)) |> 
   select(-c(data, lm))
+
+slopes_byspp |> 
+  filter(taxon == "Coral")
 
 ```
 
@@ -1812,7 +1817,7 @@ output_spearmans |>
 
 final_output <- 
   slopes_byspp |> 
-  select(taxon, species_name, slope) |> 
+  select(taxon, species_name, slope, slope_error) |> 
   mutate(decade_change = exp(10*slope)) |> 
   left_join(output_spearmans) |> 
   select(-n_row) |> 
@@ -2351,7 +2356,7 @@ final_output |>
 
 final_output |> 
   left_join(species_tbl) |>
-    filter(taxon == "Vertebrate",
+  filter(taxon == "Vertebrate",
          biogeog == "tropical") |> 
   count(class)
 
@@ -2883,8 +2888,8 @@ here("output", "figs", "extended_fig03.png") |> knitr::include_graphics()
 
 
 plot_sensitivity <- function(nsurvs, remove_x_axis = FALSE){
- 
-    site_code_tokeep <- 
+  
+  site_code_tokeep <- 
     data_clean |> 
     filter(!is.na(count_raw), 
            year >= 2008) |> 
@@ -3157,3 +3162,193 @@ save_plot(filename = here("output", "figs", "sensitivity_analysis.png"),
 here("output", "figs", "sensitivity_analysis.png") |> knitr::include_graphics()
 
 ```
+
+
+# Aggregating error
+
+```{r}
+
+sort_factors <- function(data){
+   data |> 
+  mutate(biogeog = factor(biogeog, 
+                          levels = c("tropical", "warm", "cool"),
+                          labels = c("Tropical", "Warm", "Cool"))) |> 
+  mutate(taxon = factor(taxon, 
+                        levels = c("All species",
+                                   "Coral",  
+                                   "Macroalgae", 
+                                   "Invertebrate",
+                                   "Vertebrate"),
+                        labels = c("All species",
+                                   "Coral",  
+                                   "Macroalgae", 
+                                   "Mobile invertebrates",
+                                   "Vertebrates")))
+}
+
+
+fig04_data_separated_weighted <- 
+  final_output |> 
+  left_join(species_tbl) |> 
+  filter(slope_error<0.02)|>
+  group_by(taxon, biogeog) |> 
+  summarise(
+    y = weighted.mean(x = slope,
+                      w = 1/(slope_error),
+                      na.rm = TRUE),
+    sd =  sqrt(Hmisc::wtd.var(x = slope, weights = 1/(slope_error), na.rm = TRUE)),
+    n = n(),
+    .groups = "drop") |> 
+  mutate(ci = qnorm(.95)*(sd/sqrt(n))) |> 
+  filter(n > 1) |> # remove single points 
+  bind_rows(tibble(taxon = "All species", y = NA, biogeog = NA)) |>
+  mutate(uppr = y + ci,
+         lwr = y - ci) |> 
+  mutate(decade_change = exp(y*10),
+         decade_change_lwr = exp(lwr*10),
+         decade_change_uppr = exp(uppr*10)) |> 
+  sort_factors() 
+
+
+fig04_data_separated_intmodel <- 
+  final_output |> 
+  left_join(species_tbl) |> 
+  filter(slope_error<0.02)|>
+  group_by(taxon, biogeog) |> 
+  nest() |> 
+  mutate(out = map(.x = data, ~lm(.x$slope~1, weights = 1/.x$slope_error, data=.x)),
+         y =  map_dbl(.x = out, ~coef(.x)[1]),
+         lwr = map_dbl(.x = out, ~confint(.x)[1]),
+         uppr = map_dbl(.x = out, ~confint(.x)[2]), 
+         n = map_dbl(.x = data, ~nrow(.x))) |> 
+  mutate(decade_change = exp(y*10), 
+         decade_change_lwr = exp(lwr*10),
+         decade_change_uppr = exp(uppr*10)) |> 
+  sort_factors()
+
+
+
+# Mean slope for all species combined
+fig04_data_allspp_weighted <-
+  final_output |> 
+  left_join(species_tbl) |> 
+  filter(slope_error<0.02) |>
+  summarise(  y = weighted.mean(x = slope,
+                                w = 1/(slope_error),
+                                na.rm = TRUE),
+              sd =  sqrt(Hmisc::wtd.var(x = slope, weights = 1/(slope_error), na.rm = TRUE)),
+              n = n(),
+              .groups = "drop") |> 
+  mutate(ci = qnorm(.95)*(sd/sqrt(n))) |> 
+  mutate(taxon = "All species")|> 
+  mutate(uppr = y + ci,
+         lwr = y - ci) |> 
+  mutate(decade_change = exp(y*10),
+         decade_change_lwr = exp(lwr*10),
+         decade_change_uppr = exp(uppr*10))
+
+# Mean slope for all species combined
+fig04_data_allspp_intmodel <-
+  final_output |> 
+  left_join(species_tbl) |> 
+  filter(slope_error<0.02) |>
+  nest(data = everything()) |>
+  mutate(lm = map(.x = data, ~lm(.x$slope~1, weights = 1/.x$slope_error, data=.x)),
+         y =  map_dbl(.x = lm, ~coef(.x)[1]),
+         lwr = map_dbl(.x = lm, ~confint(.x)[1]),
+         uppr = map_dbl(.x = lm, ~confint(.x)[2]),
+         n = map_dbl(.x = data, ~nrow(.x))) |> 
+  mutate(decade_change = exp(y*10), 
+         decade_change_lwr = exp(lwr*10),
+         decade_change_uppr = exp(uppr*10)) |> 
+  mutate(taxon = "All species") 
+
+
+
+plot_fig4 <- function(data_separated, data_allspp, title){
+  
+  data_separated |> 
+  ggplot() + 
+    aes(x = fct_cross(taxon, biogeog),
+        y = decade_change) +
+    geom_rect(ymin = -Inf, 
+              ymax = 1, 
+              xmin = -Inf, 
+              xmax = Inf, 
+              fill = grey_bkgrnd_col,
+              col = "transparent") +
+    # species separated by biogeography and taxon
+    geom_point(size = 4, aes(colour = biogeog)) +
+    geom_errorbar(aes(ymin = decade_change_lwr, 
+                      ymax = decade_change_uppr,
+                      colour = biogeog), 
+                  width = 0.2,
+                  show.legend = FALSE) +
+    geom_text(aes(y = decade_change_lwr - 0.01, label = n), 
+              vjust = 1) +
+    # all species combined
+    geom_point(size = 4, 
+               aes(x = taxon),
+               data = data_allspp) +
+    geom_errorbar(aes(ymin = decade_change_lwr, 
+                      ymax = decade_change_uppr, 
+                      x = taxon), 
+                  width = 0.2,
+                  show.legend = FALSE,
+                  data = data_allspp) +
+    geom_text(aes(x = taxon, 
+                  y = decade_change_lwr - 0.01, 
+                  label = n), 
+              vjust = 1, 
+              data = data_allspp) +
+    scale_color_manual(values = biogeog_cols) +
+    facet_grid(~taxon, 
+               scales = "free_x", 
+               space = "free",
+               switch = "both",
+               labeller = label_wrap_gen(width=10)) +
+    scale_y_continuous(labels = label_number(suffix = "x", 
+                                             accuracy = 0.1), 
+                       breaks = seq(0.4, 1.6, 0.2)) +
+    labs(x = "",
+         y = "Decadal change") +
+    # theme_minimal() +
+    theme(axis.title.x = element_blank(),
+          panel.grid = element_blank(), 
+          legend.position = c(0.95, 0.95),
+          legend.justification = c(1,1),
+          legend.title = element_blank(),
+          axis.text.y = element_text(size = 14),
+          axis.text.x = element_blank(),
+          axis.title.y = element_text(size = 18),
+          axis.line = element_line(size = 0.7),
+          axis.ticks = element_line(size = 0.7),
+          strip.placement = "outside",
+          strip.text = element_text(size = 12),
+          legend.margin = margin(t=-0,l=0.1,b=0.1,r=0.2, unit='cm'),
+          legend.background = element_rect(size = 0.5),
+          panel.spacing = unit(0.1, "lines")) +
+    ggtitle(title)
+}  
+
+
+plot_fig4(fig04_data_separated_weighted, 
+          fig04_data_allspp_weighted,
+          "weighted_mean, weighted_sd approach, se<0.02")
+
+ggsave("error1_se002.png")
+
+# warm coral has huge error bars
+plot_fig4(fig04_data_separated_intmodel |> filter(!(biogeog=="Warm"&taxon=="Coral")), 
+          fig04_data_allspp_intmodel,
+          "intercept_model_approach, se<0.02")
+
+ggsave("error2se002.png")
+
+
+```
+
+```{r}
+
+```
+
